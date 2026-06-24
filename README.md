@@ -108,9 +108,11 @@ OSM provides vector polygons with farmlands, specifying the crop-type and if it 
 
 Note that the farmland names have to follow the same naming convention of MAPSPAM.
 
-## Test
+### Test
+To test the repository, download the Data folder from Zenodo: https://zenodo.org/records/20834680 
+Download the Data folder and copy-paste it in the repository. Then unzip the Test.zip folder in the 00.InputData folder and run the notebook.
 
-Before running the notebook, check the test folder. The contenct can be copy-pasted into the Data/00.InputData folder to test the worklow.
+
 ---
 
 # Workflow Steps
