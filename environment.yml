@@ -1,0 +1,23 @@
+name: BaseMap
+channels:
+  - defaults
+dependencies:
+  - python=3.8
+  - numpy
+  - pandas
+  - geopandas
+  - rasterio
+  - shapely
+  - pyproj
+  - jupyter
+  - matplotlib
+  - scikit-learn
+  - seaborn
+  - pip
+  - pip:
+      - geopandas
+      - rasterstats
+      - fiona
+      - mapclassify
+      - contextily
+      - folium
