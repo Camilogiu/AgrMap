@@ -42,6 +42,7 @@ The workflow consists of eight main steps:
 6. Resample the rasters to the cropland point layer (created in step 1).
 7. Cropland calibration. 
 8. Assigning farming systems. 
+9. Adding crop water demand.
 
 For further information about each step, see the Wokflow section below.
 
@@ -108,11 +109,9 @@ OSM provides vector polygons with farmlands, specifying the crop-type and if it 
 
 Note that the farmland names have to follow the same naming convention of MAPSPAM.
 
-### Test
-To test the repository, download the Data folder from Zenodo: https://zenodo.org/records/20834680 
-Download the Data folder and copy-paste it in the repository. Then unzip the Test.zip folder in the 00.InputData folder and run the notebook.
+## Test
 
-
+Before running the notebook, check the test folder. The contenct can be copy-pasted into the Data/00.InputData folder to test the worklow.
 ---
 
 # Workflow Steps
@@ -504,6 +503,17 @@ Final output table format:
 | -- | - | - | --------| ------- | ------ | ------- |
 
 ---
+## Step 9 – Add crop water demand.
+
+This final step estimates crop-specific water demand. Crop water deficit data are sourced from GAEZ v5. The dataset is provided in mm at approximately 10 km spatial resolution. Depending on user settings, the dataset can be sourced from different climate models. The final output is a GeoPackage file with crop specific water requirements in Bcm over hectares. 
+
+
+Final output table format:
+
+| id | x | y | MAIZ_HI | MAIZ_HR | cwd_MAIZ_LI| cwd_MAIZ_LR |
+| -- | - | - | --------| ------- | ---------- | ----------- |
+
+---
 
 # Output Structure 
 
@@ -519,6 +529,9 @@ Data/
 └── 03.Final/
     └── 01.{Country_name}_Crop_IR/
     └── 02.Calibration/
+└── 04.CropWaterDemand/
+    └── 01.{Country_name}_Clipped_Rasters/
+    └── 02.Reprojected_Rasters/
 
 ```
 
@@ -528,3 +541,5 @@ Data/
 ## License
 
 MIT License
+
+
