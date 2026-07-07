@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import rasterio
 import geopandas as gpd
+gpd.options.io_engine = "fiona"
 from shapely.geometry import Point
 from rasterio.features import rasterize
 from rasterio.warp import calculate_default_transform
@@ -288,11 +289,12 @@ class Raster:
 
         try:
             # disable spatial index creation (avoids inserting into gpkg_extensions)
-            target_gdf.to_file(
+                target_gdf.to_file(
                 output_gpkg,
                 driver="GPKG",
                 layer=f"{Country_name}_crp_farmland",
                 layer_creation_options=["SPATIAL_INDEX=NO"],
+                engine="fiona",
             )
         except Exception:
             # fallback: write to temporary file then move into place
@@ -304,6 +306,7 @@ class Raster:
                 driver="GPKG",
                 layer=f"{Country_name}_crp_farmland",
                 layer_creation_options=["SPATIAL_INDEX=NO"],
+                engine="fiona",
             )
             os.replace(tmp_fp, output_gpkg)
 
@@ -872,6 +875,7 @@ class Map:
             driver="GPKG",
             layer=f"{Country_name}_crop_IR",
             layer_creation_options=["SPATIAL_INDEX=NO"],
+            engine="fiona",
         )
 
         print(f"Saved resampled point vector: {os.path.basename(out_gpkg)} with {len(gdf)} points")
@@ -931,6 +935,7 @@ class Map:
             driver="GPKG",
             layer=f"{Country_name}_crop_IR_filtered",
             layer_creation_options=["SPATIAL_INDEX=NO"],
+            engine="fiona",
         )
 
         return output_fp, filtered_gdf
@@ -1431,7 +1436,7 @@ class Map:
         Redistribute crop density so every point has total density <= 1.0.
 
         The algorithm preserves the original crop composition of excess density
-        from overloaded points and transfers it to the nearest available points
+        from overloaded points and transfers it to the nearest available geographic points
         with remaining capacity.
 
         Parameters
@@ -1482,16 +1487,19 @@ class Map:
         row_sum = np.sum(values, axis=1)
         capacity = np.maximum(1.0 - row_sum, 0.0)
 
+        #Extract coordinates from geometries
         coords = np.array([[geom.x, geom.y] for geom in gdf.geometry])
         if coords.size == 0:
             raise ValueError("Input GeoPackage contains no geometries.")
 
+        #Find candidate receivers 
         def get_receivers(exclude_idx=None):
             receiver_mask = capacity > tolerance
             if exclude_idx is not None:
                 receiver_mask[exclude_idx] = False
             return np.where(receiver_mask)[0]
 
+        #Receivers are ordered by geographic distance 
         def distance_order(source_idx, receiver_idxs):
             if receiver_idxs.size == 0:
                 return receiver_idxs
@@ -1499,6 +1507,7 @@ class Map:
             dist = np.hypot(delta[:, 0], delta[:, 1])
             return receiver_idxs[np.argsort(dist)]
 
+        
         overloaded = np.where(row_sum > 1.0 + tolerance)[0]
         if overloaded.size == 0:
             if os.path.exists(output_fp):
@@ -1578,6 +1587,149 @@ class Map:
         )
 
         return output_fp
+
+    def track_crop_movements(
+        Country_name: str,
+        original_gpkg: str = None,
+        redistributed_gpkg: str = None,
+        output_csv: str = None,
+        tolerance: float = 1e-6,
+    ):
+        """
+        Infer and record where crop density was moved between two GeoPackages.
+
+        This function compares `original_gpkg` and `redistributed_gpkg`, computes
+        per-crop differences (redistributed - original) and greedily matches
+        negative deltas (sources) to positive deltas (receivers) by nearest
+        coordinates, producing a transfer log CSV with one row per inferred
+        transfer: crop, source_id, source_x, source_y, target_id, target_x,
+        target_y, amount_ha (in density units of the input layer).
+
+        Returns:
+            (output_csv_path, DataFrame)
+        """
+        if original_gpkg is None:
+            original_gpkg = os.path.join(
+                Data_dir,
+                "03.Final",
+                f"01.{Country_name}_crop_IR",
+                f"{Country_name}_crop_IR_calibrated1.gpkg",
+            )
+        if redistributed_gpkg is None:
+            redistributed_gpkg = os.path.join(
+                Data_dir,
+                "03.Final",
+                f"01.{Country_name}_crop_IR",
+                f"{Country_name}_crop_IR_calibrated2.gpkg",
+            )
+        if output_csv is None:
+            out_dir = os.path.join(Data_dir, "03.Final", f"01.{Country_name}_crop_IR")
+            os.makedirs(out_dir, exist_ok=True)
+            output_csv = os.path.join(out_dir, f"Calibrated_crops_{Country_name}.csv")
+
+        if not os.path.exists(original_gpkg):
+            raise FileNotFoundError(f"Original GeoPackage not found: {original_gpkg}")
+        if not os.path.exists(redistributed_gpkg):
+            raise FileNotFoundError(f"Redistributed GeoPackage not found: {redistributed_gpkg}")
+
+        g_orig = gpd.read_file(original_gpkg)
+        g_red = gpd.read_file(redistributed_gpkg)
+
+        # ensure x/y columns
+        for g in (g_orig, g_red):
+            if 'x' not in g.columns or 'y' not in g.columns:
+                if g.geometry.is_empty.any():
+                    raise ValueError("Point geometries required to compute x/y coordinates.")
+                g['x'] = g.geometry.x
+                g['y'] = g.geometry.y
+
+        # determine id column
+        if 'id' in g_orig.columns:
+            ids = g_orig['id'].astype(str)
+        elif 'pixel_id' in g_orig.columns:
+            ids = g_orig['pixel_id'].astype(str)
+        else:
+            ids = pd.Series(g_orig.index.astype(str), index=g_orig.index)
+
+        # identify crop columns (same logic as redistribution)
+        cols = list(g_orig.columns)
+        if 'farms' not in cols:
+            raise ValueError("Original GeoPackage must contain a 'farms' column.")
+        farms_index = cols.index('farms')
+        crop_cols = [
+            c for c in cols[farms_index + 1 :] if isinstance(c, str) and re.match(r"^[A-Z]{4}_[IR]$", c)
+        ]
+        if not crop_cols:
+            raise ValueError("No crop columns found after the 'farms' column in original GeoPackage.")
+
+        # ensure redistributed has same crop columns (if missing, treat as zeros)
+        for c in crop_cols:
+            if c not in g_red.columns:
+                g_red[c] = 0.0
+
+        coords = np.vstack([g_orig['x'].to_numpy(), g_orig['y'].to_numpy()]).T
+
+        records = []
+
+        for crop in crop_cols:
+            delta = g_red[crop].astype(float).fillna(0.0).to_numpy() - g_orig[crop].astype(float).fillna(0.0).to_numpy()
+            sources_idx = np.where(delta < -tolerance)[0]
+            sinks_idx = np.where(delta > tolerance)[0]
+            if sources_idx.size == 0 or sinks_idx.size == 0:
+                continue
+
+            sources = {i: -float(delta[i]) for i in sources_idx}
+            sinks = {j: float(delta[j]) for j in sinks_idx}
+
+            # for each source, match to nearest sinks greedily
+            for src in sorted(sources.keys(), key=lambda i: -sources[i]):
+                remaining = sources[src]
+                if remaining <= tolerance:
+                    continue
+
+                # compute distances to all sinks with remaining capacity
+                sink_idxs = [j for j, amt in sinks.items() if amt > tolerance]
+                if not sink_idxs:
+                    break
+                deltas = coords[sink_idxs] - coords[src]
+                dists = np.hypot(deltas[:, 0], deltas[:, 1])
+                order = np.argsort(dists)
+
+                for idx in order:
+                    j = sink_idxs[idx]
+                    avail = sinks[j]
+                    if avail <= tolerance:
+                        continue
+                    transfer = min(remaining, avail)
+                    if transfer <= tolerance:
+                        continue
+
+                    records.append(
+                        {
+                            'crop': crop,
+                            'source_id': str(ids.iloc[src]) if hasattr(ids, 'iloc') else str(ids[src]),
+                            'source_x': float(coords[src, 0]),
+                            'source_y': float(coords[src, 1]),
+                            'target_id': str(ids.iloc[j]) if hasattr(ids, 'iloc') else str(ids[j]),
+                            'target_x': float(coords[j, 0]),
+                            'target_y': float(coords[j, 1]),
+                            'amount': float(transfer),
+                        }
+                    )
+
+                    # update remaining and sinks
+                    remaining -= transfer
+                    sinks[j] = max(sinks[j] - transfer, 0.0)
+                    if remaining <= tolerance:
+                        break
+
+        df_rec = pd.DataFrame.from_records(records, columns=['crop','source_id','source_x','source_y','target_id','target_x','target_y','amount'])
+        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+        df_rec.to_csv(output_csv, index=False)
+
+        return output_csv, df_rec
+
+
 
     def create_final_cropland_map(
         Country_name: str,
@@ -1847,3 +1999,289 @@ class Map:
             "irrigation_share": irrigation_share_fp,
         }
 
+class Water: 
+    def __init__(self):
+        pass
+
+        """
+        This class contains all the methods needed for estimating the crop water demand based on GAEZ_v5 data. 
+    
+        """
+
+    @staticmethod
+    def convert_crops_to_GAEZ(irrigated_crop_list, crop_code_csv=None):
+        """Convert irrigated crop labels from MAPSPAM-style names to GAEZ crop codes.
+
+        Parameters
+        ----------
+        irrigated_crop_list : list of str
+            Crop names in the format 'XXXX_LI' or 'XXXX_HI'.
+        crop_code_csv : str, optional
+            Path to the crop code mapping CSV. If None, uses Input_data/Gaez_crop_code.csv.
+
+        Returns
+        -------
+        list of str
+            Converted crop names in the format 'CODE_LILM' or 'CODE_HILM'.
+        """
+        if crop_code_csv is None:
+            crop_code_csv = os.path.join(Input_data, "Gaez_crop_code.csv")
+
+        if not os.path.exists(crop_code_csv):
+            raise FileNotFoundError(f"Crop code CSV not found: {crop_code_csv}")
+
+        df = pd.read_csv(crop_code_csv, dtype=str).fillna("")
+        if "MAPSPAM" not in df.columns or "Code" not in df.columns:
+            raise ValueError(
+                f"Crop code CSV must contain 'Code' and 'MAPSPAM' columns: {crop_code_csv}"
+            )
+
+        mapping = {
+            row["MAPSPAM"].strip().upper(): row["Code"].strip().upper()
+            for _, row in df.iterrows()
+            if row["MAPSPAM"].strip() and row["Code"].strip()
+        }
+
+        result = []
+        for name in irrigated_crop_list:
+            if not isinstance(name, str) or "_" not in name:
+                raise ValueError(
+                    f"Invalid irrigated crop name format, expected 'XXXX_LI' or 'XXXX_HI': {name}"
+                )
+
+            crop, system = name.split("_", 1)
+            crop = crop.strip().upper()
+            system = system.strip().upper()
+
+            if crop not in mapping:
+                raise ValueError(
+                    f"MAPSPAM crop code '{crop}' not found in {crop_code_csv}"
+                )
+
+            if system == "HI":
+                system_code = "HILM"
+            elif system == "LI":
+                system_code = "LILM"
+            else:
+                raise ValueError(
+                    f"Invalid irrigation system suffix, expected 'HI' or 'LI': {name}"
+                )
+
+            result.append(f"{mapping[crop]}_{system_code}")
+
+        return result
+    
+    def build_gaez_cwd_urls(
+        SSP,
+        Climate_model,
+        irrigated_crops_GAEZ,
+        base_url=None,
+    ):
+        
+        """
+         This function builds urls for downloading GAEZ v5 data. More info are available here: https://github.com/un-fao/gaezv5/wiki/21.-GAEZ-v5-Platform-User-Guide 
+
+        """
+        if base_url is None:
+            base_url = (
+                "https://storage.googleapis.com/fao-gismgr-gaez-v5-data/DATA/GAEZ-V5/MAPSET/RES02-WDE/GAEZ-V5.RES02-WDE."
+            )
+
+        if str(SSP).lower().startswith("hist") or str(SSP).lower() == "historical":
+            period_code = "HP0120"
+            ssp_code = "HIST"
+            climate_models = [Climate_model]
+        else:
+            period_code = "FP2140"
+            ssp_map = {"ssp126": "SSP126", "ssp370": "SSP370", "ssp585": "SSP585"}
+            ssp_code = ssp_map.get(str(SSP).lower(), str(SSP).upper())
+            climate_models = [Climate_model]
+
+        urls = []
+        for climate in climate_models:
+            for crop_entry in irrigated_crops_GAEZ:
+                if not isinstance(crop_entry, str) or "_" not in crop_entry:
+                    raise ValueError(f"Invalid irrigated crop name: {crop_entry}")
+
+                crop_code, input_code = crop_entry.strip().upper().split("_", 1)
+                if input_code not in ("LILM", "HILM"):
+                    raise ValueError(
+                        f"Invalid irrigation input suffix, expected LILM or HILM: {input_code}"
+                    )
+
+                filename = f"{period_code}.{climate}.{ssp_code}.{crop_code}.{input_code}.tif"
+                url = f"{base_url}{filename}"
+                urls.append({"crop_entry": crop_entry, "url": url, "filename": filename})
+
+        return urls
+
+
+    def download_gaez_rasters(url_records, output_folder, overwrite=False):
+        os.makedirs(output_folder, exist_ok=True)
+
+        downloaded = []
+        skipped = []
+        errors = []
+
+        for rec in url_records:
+            url = rec["url"]
+            filename = rec["filename"]
+            output_path = os.path.join(output_folder, filename)
+
+            if os.path.exists(output_path) and not overwrite:
+                skipped.append(output_path)
+                print(f"Skipped (exists): {filename}")
+                continue
+
+            try:
+                head = requests.head(url, allow_redirects=True, timeout=15)
+                if head.status_code != 200:
+                    errors.append((url, f"HEAD status {head.status_code}"))
+                    print(f"URL unavailable: {url} (status {head.status_code})")
+                    continue
+
+                with requests.get(url, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    with open(output_path, "wb") as dst:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                dst.write(chunk)
+
+                downloaded.append(output_path)
+                print(f"Downloaded: {filename}")
+
+            except requests.RequestException as exc:
+                errors.append((url, str(exc)))
+                print(f"Failed to download {url}: {exc}")
+            except Exception as exc:
+                errors.append((url, str(exc)))
+                print(f"Failed to download {url}: {exc}")
+
+        return {"downloaded": downloaded, "skipped": skipped, "errors": errors}
+
+    def resample_cwd_to_points(
+        Country_name=str,
+        input_dir=None,
+        cropland_gpkg=None,
+        output_dir=None,
+        out_nodata=None,
+    ):
+        """Sample reprojected crop water demand rasters onto the cropland point layer and save `cwd.gpkg`.
+           The value of cwd is expressed in BCM/ha.
+
+        Parameters
+        ----------
+        Country_name : str
+            Country code for naming outputs.
+        input_dir : str, optional
+            Folder containing the reprojected crop water demand rasters. Defaults to
+            Data/04.CropWaterDemand/02.Reprojected_Rasters.
+        cropland_gpkg : str, optional
+            Path to cropland point GeoPackage. Defaults to
+            Data/03.Final/{Country_name}_irrigated.gpkg.
+        output_dir : str, optional
+            Folder where `cwd.gpkg` will be written. Defaults to
+            Data/04.CropWaterDemand.
+        out_nodata : numeric, optional
+            Value to treat as nodata when sampling. Defaults to 0.
+
+        Returns
+        -------
+        tuple
+            (out_gpkg_path, GeoDataFrame)
+        """
+        if input_dir is None:
+            input_dir = os.path.join(Data_dir, '04.CropWaterDemand', '02.Reprojected_Rasters')
+        if cropland_gpkg is None:
+            cropland_gpkg = os.path.join(Data_dir, '03.Final', f"{Country_name}_irrigated.gpkg")
+        if output_dir is None:
+            output_dir = os.path.join(Data_dir, '04.CropWaterDemand')
+        os.makedirs(output_dir, exist_ok=True)
+
+        if out_nodata is None:
+            out_nodata = 0
+
+        if not os.path.isdir(input_dir):
+            raise FileNotFoundError(f"Input raster folder not found: {input_dir}")
+        if not os.path.exists(cropland_gpkg):
+            raise FileNotFoundError(f"Cropland point layer not found: {cropland_gpkg}")
+
+        gdf = gpd.read_file(cropland_gpkg)
+        if gdf.crs is None:
+            raise ValueError("Cropland layer has no CRS")
+        original_crs = gdf.crs
+
+        raster_files = sorted(glob.glob(os.path.join(input_dir, "*.tif")))
+        if not raster_files:
+            raise FileNotFoundError(f"No reprojected rasters found in: {input_dir}")
+
+        # Use pattern matching on GAEZ filenames like: HP0120.AGERA5.HIST.BANA.LILM.tif
+        pattern = re.compile(r"^(?:[^.]+)\.(?:[^.]+)\.(?:[^.]+)\.(?P<crop>[A-Z]{4})\.(?P<input>LILM|HILM)\.tif$", re.IGNORECASE)
+
+        # Ensure points are in raster CRS for sampling using the first raster
+        with rasterio.open(raster_files[0]) as src0:
+            raster_crs = src0.crs
+            if raster_crs is None:
+                raise ValueError(f"First raster has no CRS: {raster_files[0]}")
+            if not gdf.crs.is_exact_same(raster_crs):
+                gdf = gdf.to_crs(raster_crs)
+
+        # Sample each raster and add a column to gdf
+        for raster_path in raster_files:
+            name = os.path.basename(raster_path)
+            m = pattern.match(name)
+            if not m:
+                # skip files that don't match expected GAEZ pattern
+                continue
+
+            crop_code = m.group('crop').upper()
+            input_code = m.group('input').upper()
+            system = 'LI' if input_code == 'LILM' else 'HI'
+            field_name = f"cwd_{crop_code}_{system}"
+
+            with rasterio.open(raster_path) as src:
+                nod = src.nodata if src.nodata is not None else out_nodata
+                arr = src.read(1)
+                transform = src.transform
+
+                vals = []
+                for pt in gdf.geometry:
+                    # use point coords in raster CRS
+                    try:
+                        row, col = rasterio.transform.rowcol(transform, pt.x, pt.y)
+                    except Exception:
+                        vals.append(float(0.0))
+                        continue
+
+                    if 0 <= row < src.height and 0 <= col < src.width:
+                        v = arr[row, col]
+                    else:
+                        v = nod
+
+                    if v is None or (isinstance(v, float) and np.isnan(v)) or (nod is not None and v == nod):
+                        vals.append(float(0.0))
+                    else:
+                        vals.append(float(v) * 0.00000001) # convert from mm to BCM/ha
+
+            gdf[field_name] = np.array(vals, dtype=np.float32)
+
+        # ensure x/y columns
+        if 'x' not in gdf.columns or 'y' not in gdf.columns:
+            gdf['x'] = gdf.geometry.x
+            gdf['y'] = gdf.geometry.y
+
+        # Convert back to original CRS for saving
+        try:
+            if original_crs is not None and not gdf.crs.is_exact_same(original_crs):
+                gdf = gdf.to_crs(original_crs)
+        except Exception:
+            pass
+
+        out_gpkg = os.path.join(output_dir, 'cwd.gpkg')
+        if os.path.exists(out_gpkg):
+            os.remove(out_gpkg)
+
+        gdf.to_file(out_gpkg, driver='GPKG', layer='cwd', layer_creation_options=['SPATIAL_INDEX=NO'])
+
+        return out_gpkg, gdf
+    
