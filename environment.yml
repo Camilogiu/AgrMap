@@ -1,23 +1,23 @@
 name: BaseMap
 channels:
+  - conda-forge
   - defaults
 dependencies:
-  - python=3.8
-  - numpy
-  - pandas
-  - geopandas
-  - rasterio
-  - shapely
-  - pyproj
+  - python=3.10
+  - numpy=1.26
+  - pandas=2.1.4
+  - geopandas=0.14.4
+  - rasterio=1.3.9
+  - fiona=1.9.6
+  - shapely=2.0.4
+  - pyproj=3.6.1
   - jupyter
   - matplotlib
   - scikit-learn
   - seaborn
   - pip
   - pip:
-      - geopandas
       - rasterstats
-      - fiona
       - mapclassify
       - contextily
       - folium
