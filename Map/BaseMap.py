@@ -2261,7 +2261,7 @@ class Water:
                     if v is None or (isinstance(v, float) and np.isnan(v)) or (nod is not None and v == nod):
                         vals.append(float(0.0))
                     else:
-                        vals.append(float(v) * 0.00000001) # convert from mm to BCM/ha
+                        vals.append(float(v) * 0.00000001) # convert from mm to BCM/ha assuming 1 millimeter  = 1 liter per 1 square meter
 
             gdf[field_name] = np.array(vals, dtype=np.float32)
 
