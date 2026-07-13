@@ -293,7 +293,7 @@ class Raster:
                 output_gpkg,
                 driver="GPKG",
                 layer=f"{Country_name}_crp_farmland",
-                layer_creation_options=["SPATIAL_INDEX=NO"],
+                layer_options={"SPATIAL_INDEX": "NO"},
                 engine="fiona",
             )
         except Exception:
@@ -305,7 +305,7 @@ class Raster:
                 tmp_fp,
                 driver="GPKG",
                 layer=f"{Country_name}_crp_farmland",
-                layer_creation_options=["SPATIAL_INDEX=NO"],
+                layer_options={"SPATIAL_INDEX": "NO"},
                 engine="fiona",
             )
             os.replace(tmp_fp, output_gpkg)
@@ -874,7 +874,7 @@ class Map:
             out_gpkg,
             driver="GPKG",
             layer=f"{Country_name}_crop_IR",
-            layer_creation_options=["SPATIAL_INDEX=NO"],
+            layer_options={"SPATIAL_INDEX": "NO"},
             engine="fiona",
         )
 
@@ -934,7 +934,7 @@ class Map:
             output_fp,
             driver="GPKG",
             layer=f"{Country_name}_crop_IR_filtered",
-            layer_creation_options=["SPATIAL_INDEX=NO"],
+            layer_options={"SPATIAL_INDEX": "NO"},
             engine="fiona",
         )
 
@@ -1419,7 +1419,7 @@ class Map:
             output_fp,
             driver="GPKG",
             layer=f"{Country_name}_crop_IR_calibrated1",
-            layer_creation_options=["SPATIAL_INDEX=NO"],
+            layer_options={"SPATIAL_INDEX": "NO"},
         )
 
         return output_fp
@@ -1435,16 +1435,14 @@ class Map:
         """
         Redistribute crop density so every point has total density <= 1.0.
 
-        The algorithm preserves the original crop composition of excess density
-        from overloaded points and transfers it to the nearest available geographic points
-        with remaining capacity.
+        Two-phase redistribution:
+        1) Prioritise the distribution of irrigated crops: all the rows where the value is > 1 is redistributed to the nearest point.
+        2) Finalise by redistributing only rainfed values so each row total <= 1.
 
-        Parameters
-        ----------
-        target_crs : pyproj.CRS or str or int, optional
-            If provided, reprojects the output GeoDataFrame to this CRS before
-            saving the calibrated GeoPackage.
+        Returns output path.
         """
+        print("Seat back and relax, this may take a while for large datasets...")
+
         if input_gpkg is None:
             input_gpkg = os.path.join(
                 Data_dir,
@@ -1452,16 +1450,13 @@ class Map:
                 f"01.{Country_name}_crop_IR",
                 f"{Country_name}_crop_IR_calibrated1.gpkg",
             )
-        if output_dir is None:
-            output_dir = os.path.join(Data_dir, "03.Final", f"01.{Country_name}_crop_IR")
-        os.makedirs(output_dir, exist_ok=True)
 
+        if output_dir is None:
+            output_dir = os.path.join(os.path.dirname(input_gpkg), "")
+        os.makedirs(output_dir, exist_ok=True)
         if out_gpkg_name is None:
             out_gpkg_name = f"{Country_name}_crop_IR_calibrated2.gpkg"
-
         output_fp = os.path.join(output_dir, out_gpkg_name)
-        if not os.path.exists(input_gpkg):
-            raise FileNotFoundError(f"Input GeoPackage not found: {input_gpkg}")
 
         gdf = gpd.read_file(input_gpkg)
         if target_crs is not None:
@@ -1472,34 +1467,110 @@ class Map:
         cols = list(gdf.columns)
         if "farms" not in cols:
             raise ValueError("The GeoPackage must contain a 'farms' column.")
-
         farms_index = cols.index("farms")
         crop_cols = [
-            c
-            for c in cols[farms_index + 1 :]
-            if isinstance(c, str) and re.match(r"^[A-Z]{4}_[IR]$", c)
+            c for c in cols[farms_index + 1 :] if isinstance(c, str) and re.match(r"^[A-Z]{4}_[IR]$", c)
         ]
         if not crop_cols:
             raise ValueError("No crop columns found after the 'farms' column.")
 
-        numeric = gdf[crop_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float)
-        values = numeric.to_numpy(dtype=float)
-        row_sum = np.sum(values, axis=1)
-        capacity = np.maximum(1.0 - row_sum, 0.0)
+        rainfed_cols = [c for c in crop_cols if c.endswith("_R")]
+        irrigated_cols = [c for c in crop_cols if c.endswith("_I")]
 
-        #Extract coordinates from geometries
+        # numeric matrices
+        values_R = gdf[rainfed_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float).to_numpy() if rainfed_cols else np.zeros((len(gdf), 0), dtype=float)
+        values_I = gdf[irrigated_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float).to_numpy() if irrigated_cols else np.zeros((len(gdf), 0), dtype=float)
+
         coords = np.array([[geom.x, geom.y] for geom in gdf.geometry])
         if coords.size == 0:
             raise ValueError("Input GeoPackage contains no geometries.")
 
-        #Find candidate receivers 
+        nI = values_I.shape[1]
+        nR = values_R.shape[1]
+
+        sum_I = np.sum(values_I, axis=1) if nI > 0 else np.zeros(len(gdf), dtype=float)
+        sum_R = np.sum(values_R, axis=1) if nR > 0 else np.zeros(len(gdf), dtype=float)
+        total = sum_I + sum_R
+
+        # Phase 1: redistribute irrigated-only so no row has sum(I) > 1
+        cols_I = [c for c in cols if c.endswith('_I')]
+        values_I = gdf[cols_I].fillna(0).values.astype(float)
+        coords = np.array([[pt.x, pt.y] for pt in gdf.geometry])
+        sum_I = values_I.sum(axis=1)
+
+        def nn_indices(src_idx):
+            d = np.sum((coords - coords[src_idx])**2, axis=1)
+            order = np.argsort(d)
+            return order[order != src_idx]
+
+        it = 0
+        max_iters = 10000
+        tol = 1e-8
+        while True:
+            over = np.where(sum_I > 1.0 + tol)[0]
+            if len(over) == 0:
+                break
+            if it > max_iters:
+                raise RuntimeError("Phase1: max iters reached")
+            # pick source with largest irrigated excess
+            src = over[np.argmax(sum_I[over] - 1.0)]
+            excess = sum_I[src] - 1.0
+            if excess <= tol:
+                sum_I[src] = min(sum_I[src], 1.0)
+                it += 1
+                continue
+
+            src_comp = values_I[src].copy()
+            total_src_comp = src_comp.sum()
+            # if source has no irrigated composition (rare), scale down to 1.0
+            if total_src_comp <= tol:
+                if sum_I[src] > 1.0:
+                    values_I[src] *= (1.0 / sum_I[src])
+                    sum_I[src] = values_I[src].sum()
+                it += 1
+                continue
+
+            # try to transfer to nearest receivers with irrigated capacity
+            targets = nn_indices(src)
+            for t in targets:
+                cap = max(0.0, 1.0 - sum_I[t])
+                if cap <= tol:
+                    continue
+                transfer = min(excess, cap)
+                frac = src_comp / total_src_comp
+                move = frac * transfer
+                values_I[t] += move
+                values_I[src] -= move
+                sum_I[t] = values_I[t].sum()
+                sum_I[src] = values_I[src].sum()
+                excess = sum_I[src] - 1.0
+                if sum_I[src] <= 1.0 + tol:
+                    break
+
+            # if no receiver accepted flow, scale source down to 1.0
+            if values_I[src].sum() > 1.0 + tol:
+                scale = 1.0 / values_I[src].sum()
+                values_I[src] *= scale
+                sum_I[src] = values_I[src].sum()
+
+            it += 1
+
+        # write irrigated back to gdf (rainfed columns unchanged in Phase 1)
+        for i, c in enumerate(cols_I):
+            gdf[c] = values_I[:, i]
+
+        # Phase 2: redistribute only rainfed to satisfy total<=1
+        sum_I = np.sum(values_I, axis=1) if values_I.size else np.zeros(len(gdf), dtype=float)
+        total = sum_I + (np.sum(values_R, axis=1) if values_R.size else 0.0)
+        capacity = np.maximum(1.0 - total, 0.0)
+
+        # helper functions
         def get_receivers(exclude_idx=None):
             receiver_mask = capacity > tolerance
             if exclude_idx is not None:
                 receiver_mask[exclude_idx] = False
             return np.where(receiver_mask)[0]
 
-        #Receivers are ordered by geographic distance 
         def distance_order(source_idx, receiver_idxs):
             if receiver_idxs.size == 0:
                 return receiver_idxs
@@ -1507,84 +1578,82 @@ class Map:
             dist = np.hypot(delta[:, 0], delta[:, 1])
             return receiver_idxs[np.argsort(dist)]
 
-        
-        overloaded = np.where(row_sum > 1.0 + tolerance)[0]
-        if overloaded.size == 0:
-            if os.path.exists(output_fp):
-                os.remove(output_fp)
-            gdf.to_file(
-                output_fp,
-                driver="GPKG",
-                layer=f"{Country_name}_crop_IR_calibrated2",
-                layer_creation_options=["SPATIAL_INDEX=NO"],
-            )
-            return output_fp
-
-        # Process overloaded points in descending order of excess density
+        # loop redistributing rainfed only
         while True:
-            row_sum = np.sum(values, axis=1)
-            overloaded = np.where(row_sum > 1.0 + tolerance)[0]
+            total = np.sum(values_R, axis=1) + (np.sum(values_I, axis=1) if values_I.size else 0.0)
+            overloaded = np.where(total > 1.0 + tolerance)[0]
             if overloaded.size == 0:
                 break
 
-            excess = row_sum[overloaded] - 1.0
+            excess = total[overloaded] - 1.0
             order = np.argsort(-excess)
             source_idx = overloaded[order[0]]
             source_excess = excess[order[0]]
-            source_sum = row_sum[source_idx]
-            if source_sum <= 1.0 + tolerance:
+            if source_excess <= tolerance:
                 break
+
+            sum_R_source = float(np.sum(values_R[source_idx])) if values_R.size else 0.0
+            if sum_R_source <= tolerance:
+                # cannot move rainfed; scale down proportionally to meet constraint
+                src_sum = np.sum(values_I[source_idx]) + np.sum(values_R[source_idx])
+                if src_sum > 1.0 + tolerance:
+                    scale = 1.0 / src_sum
+                    if values_R.size:
+                        values_R[source_idx] *= scale
+                    if values_I.size:
+                        values_I[source_idx] *= scale
+                # recompute capacity and continue
+                sum_I = np.sum(values_I, axis=1) if values_I.size else np.zeros(len(gdf), dtype=float)
+                capacity = np.maximum(1.0 - (np.sum(values_R, axis=1) + sum_I), 0.0)
+                continue
 
             receivers = get_receivers(exclude_idx=source_idx)
             if receivers.size == 0:
-                # No available receivers; scale down the source point to 1.0
-                scale = 1.0 / source_sum
-                values[source_idx] *= scale
+                allowed_rainfed = max(1.0 - sum_I[source_idx], 0.0)
+                cur_rainfed = sum_R_source
+                if cur_rainfed > allowed_rainfed + tolerance:
+                    scale = allowed_rainfed / cur_rainfed if cur_rainfed > 0 else 0.0
+                    values_R[source_idx] *= scale
+                capacity = np.maximum(1.0 - (np.sum(values_R, axis=1) + sum_I), 0.0)
                 continue
 
             receiver_order = distance_order(source_idx, receivers)
-            proportions = values[source_idx] / source_sum
-            remaining = source_sum - 1.0
+            proportions = values_R[source_idx] / sum_R_source
+            remaining = total[source_idx] - 1.0
 
             for recv_idx in receiver_order:
                 if remaining <= tolerance:
                     break
-
-                transfer = min(remaining, capacity[recv_idx])
-                if transfer <= tolerance:
+                accept = min(remaining, capacity[recv_idx])
+                if accept <= tolerance:
                     continue
-
-                delta = transfer * proportions
-                values[source_idx] = np.maximum(values[source_idx] - delta, 0.0)
-                values[recv_idx] += delta
-
-                row_sum[source_idx] -= transfer
-                row_sum[recv_idx] += transfer
-                capacity[recv_idx] = max(1.0 - row_sum[recv_idx], 0.0)
-                remaining -= transfer
+                delta = accept * proportions
+                values_R[source_idx] = np.maximum(values_R[source_idx] - delta, 0.0)
+                values_R[recv_idx] += delta
+                total[source_idx] -= accept
+                total[recv_idx] += accept
+                capacity[recv_idx] = max(1.0 - total[recv_idx], 0.0)
+                remaining -= accept
 
             if remaining > tolerance:
-                # If all receivers are exhausted, reduce the source proportionally to meet the constraint
-                source_sum = np.sum(values[source_idx])
-                if source_sum > 1.0 + tolerance:
-                    scale = 1.0 / source_sum
-                    values[source_idx] *= scale
+                allowed_rainfed = max(1.0 - sum_I[source_idx], 0.0)
+                cur_rainfed = float(np.sum(values_R[source_idx]))
+                if cur_rainfed > allowed_rainfed + tolerance:
+                    scale = allowed_rainfed / cur_rainfed if cur_rainfed > 0 else 0.0
+                    values_R[source_idx] *= scale
 
-            capacity = np.maximum(1.0 - np.sum(values, axis=1), 0.0)
+            sum_I = np.sum(values_I, axis=1) if values_I.size else np.zeros(len(gdf), dtype=float)
+            capacity = np.maximum(1.0 - (np.sum(values_R, axis=1) + sum_I), 0.0)
 
-        # Write redistributed values back into GeoDataFrame
-        for col_idx, col_name in enumerate(crop_cols):
-            gdf[col_name] = values[:, col_idx]
+        # write back
+        for idx, col in enumerate(irrigated_cols):
+            gdf[col] = values_I[:, idx] if values_I.size else 0.0
+        for idx, col in enumerate(rainfed_cols):
+            gdf[col] = values_R[:, idx] if values_R.size else 0.0
 
         if os.path.exists(output_fp):
             os.remove(output_fp)
-
-        gdf.to_file(
-            output_fp,
-            driver="GPKG",
-            layer=f"{Country_name}_crop_IR_calibrated2",
-            layer_creation_options=["SPATIAL_INDEX=NO"],
-        )
+        gdf.to_file(output_fp, driver="GPKG", layer=f"{Country_name}_crop_IR_calibrated2", layer_options={"SPATIAL_INDEX": "NO"})
 
         return output_fp
 
@@ -1863,7 +1932,7 @@ class Map:
             output_fp,
             driver="GPKG",
             layer=f"{Country_name}_cropland",
-            layer_creation_options=["SPATIAL_INDEX=NO"],
+            layer_options={"SPATIAL_INDEX": "NO"},
         )
 
         return output_fp
@@ -1924,7 +1993,7 @@ class Map:
             output_fp,
             driver="GPKG",
             layer=f"{Country_name}_irrigated",
-            layer_creation_options=["SPATIAL_INDEX=NO"],
+            layer_options={"SPATIAL_INDEX": "NO"},
         )
 
         return output_fp
@@ -2281,7 +2350,7 @@ class Water:
         if os.path.exists(out_gpkg):
             os.remove(out_gpkg)
 
-        gdf.to_file(out_gpkg, driver='GPKG', layer='cwd', layer_creation_options=['SPATIAL_INDEX=NO'])
+        gdf.to_file(out_gpkg, driver='GPKG', layer='cwd', layer_options={'SPATIAL_INDEX': 'NO'})
 
         return out_gpkg, gdf
     
