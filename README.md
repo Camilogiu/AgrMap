@@ -542,4 +542,11 @@ Data/
 
 MIT License
 
+---
 
+## Sources
+International Food Policy Research Institute (IFPRI), 2026, "Global Spatially-Disaggregated Crop Production Statistics Data for 2020 Version 2.0 Release 2", https://doi.org/10.7910/DVN/SWPENT, Harvard Dataverse, V5
+
+FAO & IIASA. 2025. Global Agro-ecological Zoning version 5 (GAEZ v5) Model Documentation. https://github.com/un-fao/gaezv5/wiki
+
+FAO. 2024. Crops and livestock products: Area harvested. Accessed on 05 June 2026. https://www.fao.org/faostat/en/#data/QCL Licence: CC-BY-4.0.
