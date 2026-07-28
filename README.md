@@ -111,7 +111,7 @@ Note that the farmland names have to follow the same naming convention of MAPSPA
 
 ## Test
 
-Before running the notebook, check the test folder. The contenct can be copy-pasted into the Data/00.InputData folder to test the worklow.
+Before running the notebook, check the test folder available on Zenodo https://zenodo.org/records/20834680 . The content can be copy-pasted into the Data/00.InputData folder to test the worklow.
 ---
 
 # Workflow Steps
