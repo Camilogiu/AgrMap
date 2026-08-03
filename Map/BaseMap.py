@@ -203,8 +203,31 @@ class Raster:
             class_to_name = {int(row["Class"]): row.get("Farmland", "") for _, row in lookup.iterrows()}
 
         farmlands = gpd.read_file(farmland_shapefile)
+        if "crop_class" not in farmlands.columns:
+            def assign_crop_class(row):
+                crop = str(row.get("crop", "")).lower() if pd.notna(row.get("crop")) else ""
+                irr = str(row.get("irrigation", "")).lower() if pd.notna(row.get("irrigation")) else ""
+                if "sugarcane" in crop:
+                    return 6
+                if "wheat" in crop and "pivot" in irr:
+                    return 3
+                if ("soy" in crop or "soya" in crop) and "pivot" not in irr:
+                    return 4
+                if "cassava" in crop:
+                    return 5
+                if ("corn" in crop or "maize" in crop) and "pivot" in irr:
+                    return 1
+                if ("corn" in crop or "maize" in crop):
+                    return 2
+                if "pivot" in irr:
+                    return 6
+                return 0
+            farmlands["crop_class"] = farmlands.apply(assign_crop_class, axis=1)
+
         with rasterio.open(reference_raster) as src:
-            if farmlands.crs != src.crs:
+            if farmlands.crs is None:
+                farmlands = farmlands.set_crs(src.crs)
+            elif farmlands.crs != src.crs:
                 farmlands = farmlands.to_crs(src.crs)
 
             shapes = []
@@ -285,7 +308,10 @@ class Raster:
         output_gpkg = os.path.join(output_dir, f"{Country_name}_crp_farmland.gpkg")
         # remove any existing (possibly corrupted) gpkg to force a clean create
         if os.path.exists(output_gpkg):
-            os.remove(output_gpkg)
+            try:
+                os.remove(output_gpkg)
+            except OSError:
+                pass
 
         try:
             # disable spatial index creation (avoids inserting into gpkg_extensions)
