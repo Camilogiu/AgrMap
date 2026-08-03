@@ -112,6 +112,7 @@ Note that the farmland names have to follow the same naming convention of MAPSPA
 ## Test
 
 Before running the notebook, check the test folder available on Zenodo https://zenodo.org/records/20834680 . The content can be copy-pasted into the Data/00.InputData folder to test the worklow.
+
 ---
 
 # Workflow Steps
@@ -550,3 +551,8 @@ International Food Policy Research Institute (IFPRI), 2026, "Global Spatially-Di
 FAO & IIASA. 2025. Global Agro-ecological Zoning version 5 (GAEZ v5) Model Documentation. https://github.com/un-fao/gaezv5/wiki
 
 FAO. 2024. Crops and livestock products: Area harvested. Accessed on 05 June 2026. https://www.fao.org/faostat/en/#data/QCL Licence: CC-BY-4.0.
+
+---
+
+## Acknowledgements
+The authors acknowledge the financial support from UK Aid via the Climate Compatible Growth programme. 
