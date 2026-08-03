@@ -1146,9 +1146,14 @@ class Map:
         mapping["MAPSPAM"] = mapping["MAPSPAM"].astype(str).str.upper().str.strip()
 
         harvested = pd.read_csv(harvested_csv, dtype=str).fillna("")
-        if "Crop" in harvested.columns:
-            crop_col = "Crop"
-            value_col = next((c for c in harvested.columns if c != "Crop"), None)
+        cols_lower = [c.lower().strip() for c in harvested.columns]
+
+        if "crop" in cols_lower:
+            crop_col = harvested.columns[cols_lower.index("crop")]
+            value_col = next((c for c in harvested.columns if c != crop_col), None)
+        elif "item" in cols_lower and "value" in cols_lower:
+            crop_col = harvested.columns[cols_lower.index("item")]
+            value_col = harvested.columns[cols_lower.index("value")]
         else:
             crop_col = harvested.columns[0]
             value_col = harvested.columns[1] if len(harvested.columns) > 1 else None
