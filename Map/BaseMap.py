@@ -1058,8 +1058,15 @@ class Map:
         if not os.path.exists(landcover_tif):
             raise FileNotFoundError(f"Landcover raster not found: {landcover_tif}")
         with rasterio.open(landcover_tif) as lc:
-            t = lc.transform #transform maps pixel coordinates (row,col) to geographic coordinates (x,y).
-            pixel_area_m2 = abs(t.a * t.e) #t.a is the width of a pixel and t.e is the height. 
+            t = lc.transform  # transform maps pixel coordinates (row,col) to geographic coordinates (x,y).
+            if lc.crs and lc.crs.is_geographic:
+                lat = (lc.bounds.bottom + lc.bounds.top) / 2.0
+                lat_rad = np.radians(lat)
+                dx_m = abs(t.a) * 111320.0 * np.cos(lat_rad)
+                dy_m = abs(t.e) * 111320.0
+                pixel_area_m2 = dx_m * dy_m
+            else:
+                pixel_area_m2 = abs(t.a * t.e)
             point_area_ha = pixel_area_m2 / 10000.0
 
         # identify MAPSPAM crop columns (format: XXXX_I or XXXX_R)
