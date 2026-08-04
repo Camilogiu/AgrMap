@@ -1541,61 +1541,83 @@ class Map:
             order = np.argsort(d)
             return order[order != src_idx]
 
-        it = 0
-        max_iters = 10000
-        tol = 1e-8
-        while True:
-            over = np.where(sum_I > 1.0 + tol)[0]
-            if len(over) == 0:
-                break
-            if it > max_iters:
-                raise RuntimeError("Phase1: max iters reached")
-            # pick source with largest irrigated excess
-            src = over[np.argmax(sum_I[over] - 1.0)]
-            excess = sum_I[src] - 1.0
-            if excess <= tol:
-                sum_I[src] = min(sum_I[src], 1.0)
-                it += 1
-                continue
+        # Phase 1: redistribute irrigated-only so no row has sum(I) > 1
+        cols_I = [c for c in cols if c.endswith('_I')]
+        if cols_I:
+            values_I = gdf[cols_I].fillna(0).values.astype(float)
+            coords = np.array([[pt.x, pt.y] for pt in gdf.geometry])
+            sum_I = values_I.sum(axis=1)
 
-            src_comp = values_I[src].copy()
-            total_src_comp = src_comp.sum()
-            # if source has no irrigated composition (rare), scale down to 1.0
-            if total_src_comp <= tol:
-                if sum_I[src] > 1.0:
-                    values_I[src] *= (1.0 / sum_I[src])
-                    sum_I[src] = values_I[src].sum()
-                it += 1
-                continue
-
-            # try to transfer to nearest receivers with irrigated capacity
-            targets = nn_indices(src)
-            for t in targets:
-                cap = max(0.0, 1.0 - sum_I[t])
-                if cap <= tol:
-                    continue
-                transfer = min(excess, cap)
-                frac = src_comp / total_src_comp
-                move = frac * transfer
-                values_I[t] += move
-                values_I[src] -= move
-                sum_I[t] = values_I[t].sum()
-                sum_I[src] = values_I[src].sum()
-                excess = sum_I[src] - 1.0
-                if sum_I[src] <= 1.0 + tol:
+            it = 0
+            max_iters = max(20000, len(gdf))
+            tol = 1e-8
+            while True:
+                over = np.where(sum_I > 1.0 + tol)[0]
+                if len(over) == 0:
+                    break
+                if it > max_iters:
+                    for idx in over:
+                        if sum_I[idx] > 1.0:
+                            values_I[idx] *= (1.0 / sum_I[idx])
+                            sum_I[idx] = 1.0
                     break
 
-            # if no receiver accepted flow, scale source down to 1.0
-            if values_I[src].sum() > 1.0 + tol:
-                scale = 1.0 / values_I[src].sum()
-                values_I[src] *= scale
-                sum_I[src] = values_I[src].sum()
+                # pick source with largest irrigated excess
+                src = over[np.argmax(sum_I[over] - 1.0)]
+                excess = sum_I[src] - 1.0
+                if excess <= tol:
+                    sum_I[src] = min(sum_I[src], 1.0)
+                    it += 1
+                    continue
 
-            it += 1
+                src_comp = values_I[src].copy()
+                total_src_comp = src_comp.sum()
+                if total_src_comp <= tol:
+                    values_I[src] = 0.0
+                    sum_I[src] = 0.0
+                    it += 1
+                    continue
 
-        # write irrigated back to gdf (rainfed columns unchanged in Phase 1)
-        for i, c in enumerate(cols_I):
-            gdf[c] = values_I[:, i]
+                receivers = np.where(sum_I < 1.0 - tol)[0]
+                if len(receivers) == 0:
+                    scale = 1.0 / sum_I[src]
+                    values_I[src] *= scale
+                    sum_I[src] = 1.0
+                    it += 1
+                    continue
+
+                # Pure NumPy nearest-neighbor search among valid receivers only
+                d = np.sum((coords[receivers] - coords[src])**2, axis=1)
+                k = min(50, len(receivers))
+                top_k = np.argpartition(d, k - 1)[:k]
+                sorted_k = top_k[np.argsort(d[top_k])]
+                target_indices = receivers[sorted_k]
+
+                for t in target_indices:
+                    cap = max(0.0, 1.0 - sum_I[t])
+                    if cap <= tol:
+                        continue
+                    transfer = min(excess, cap)
+                    frac = src_comp / total_src_comp
+                    move = frac * transfer
+                    values_I[t] += move
+                    values_I[src] -= move
+                    sum_I[t] = values_I[t].sum()
+                    sum_I[src] = values_I[src].sum()
+                    excess = sum_I[src] - 1.0
+                    if sum_I[src] <= 1.0 + tol:
+                        break
+
+                if sum_I[src] > 1.0 + tol:
+                    scale = 1.0 / sum_I[src]
+                    values_I[src] *= scale
+                    sum_I[src] = 1.0
+
+                it += 1
+
+            # write irrigated back to gdf
+            for i, c in enumerate(cols_I):
+                gdf[c] = values_I[:, i]
 
         # Phase 2: redistribute only rainfed to satisfy total<=1
         sum_I = np.sum(values_I, axis=1) if values_I.size else np.zeros(len(gdf), dtype=float)
