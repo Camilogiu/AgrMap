@@ -1,5 +1,6 @@
 import os
 import glob
+import inspect
 import re
 import shutil
 import requests
@@ -161,7 +162,7 @@ class Raster:
         Country_name=str,
         reference_raster=None,
         farmland_shapefile=None,
-        class_lookup_csv=None,
+        #class_lookup_csv=None,
         target_vector=None,
         output_dir=None,
         out_nodata=255,
@@ -179,9 +180,9 @@ class Raster:
         if reference_raster is None:
             reference_raster = os.path.join(Input_data, f"{Country_name}_LandCover.tif")
         if farmland_shapefile is None:
-            farmland_shapefile = os.path.join(Input_data, f"{Country_name}_farmlands.shp")
-        if class_lookup_csv is None:
-            class_lookup_csv = os.path.join(Input_data, f"{Country_name}Farmlands.csv")
+            farmland_shapefile = os.path.join(Input_data, f"farmlands_reclassified.shp")
+        # if class_lookup_csv is None:
+        #     class_lookup_csv = os.path.join(Input_data, f"{Country_name}Farmlands.csv")
         if target_vector is None:
             target_vector = os.path.join(output_dir, f"{Country_name}.gpkg")
 
@@ -189,35 +190,74 @@ class Raster:
             raise FileNotFoundError(f"Reference raster not found: {reference_raster}")
         if not os.path.exists(farmland_shapefile):
             raise FileNotFoundError(f"Farmland shapefile not found: {farmland_shapefile}")
-        if not os.path.exists(class_lookup_csv):
-            raise FileNotFoundError(f"Lookup CSV not found: {class_lookup_csv}")
+        # if not os.path.exists(class_lookup_csv):
+        #     raise FileNotFoundError(f"Lookup CSV not found: {class_lookup_csv}")
         if not os.path.exists(target_vector):
             raise FileNotFoundError(f"Target vector not found: {target_vector}")
 
-        # read lookup (expects columns "Farmland" and "Class")
-        lookup = pd.read_csv(class_lookup_csv, dtype=str)
-        try:
-            class_to_name = {int(row["Class"]): row["Farmland"] for _, row in lookup.iterrows()}
-        except Exception:
-            # tolerant fallback: try swapped column names
-            class_to_name = {int(row["Class"]): row.get("Farmland", "") for _, row in lookup.iterrows()}
+        # # read lookup (expects columns "Farmland" and "Class")
+        # lookup = pd.read_csv(class_lookup_csv, dtype=str)
+        # try:
+        #     class_to_name = {int(row["Class"]): row["Farmland"] for _, row in lookup.iterrows()}
+        # except Exception:
+        #     # tolerant fallback: try swapped column names
+        #     class_to_name = {int(row["Class"]): row.get("Farmland", "") for _, row in lookup.iterrows()}
 
         farmlands = gpd.read_file(farmland_shapefile)
         with rasterio.open(reference_raster) as src:
             if farmlands.crs != src.crs:
                 farmlands = farmlands.to_crs(src.crs)
 
-            shapes = []
+            # Build mapping from string crop_class names -> integer raster codes.
+            # Support three cases:
+            #  - crop_class already numeric (int) -> keep as-is
+            #  - crop_class string -> assign deterministic int code
+            #  - None / NaN -> ignored
+            existing_ints = set()
+            string_names = []
             for _, row in farmlands.iterrows():
-                crop_class = row.get("crop_class", None)
-                if crop_class is None or pd.isna(crop_class):
+                v = row.get("crop_class", None)
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    continue
+                # detect numeric-like values
+                try:
+                    iv = int(v)
+                    existing_ints.add(int(iv))
+                except Exception:
+                    s = str(v).strip()
+                    if s not in string_names:
+                        string_names.append(s)
+
+            # assign integer codes for string names, avoiding collisions with existing ints and nodata
+            start_code = 1
+            if existing_ints:
+                start_code = max(existing_ints) + 1
+
+            class_to_value = {}
+            next_code = start_code
+            for name in sorted(string_names, key=lambda x: x.lower()):
+                class_to_value[name] = next_code
+                next_code += 1
+
+            # Build shapes list using either existing numeric code or assigned code
+            shapes = []
+            class_to_name = {}
+            for _, row in farmlands.iterrows():
+                v = row.get("crop_class", None)
+                if v is None or (isinstance(v, float) and pd.isna(v)):
                     continue
                 try:
-                    crop_class_value = int(crop_class)
+                    code = int(v)
+                    shapes.append((row.geometry, code))
+                    # keep name mapping if geometry had a string label stored elsewhere
+                    class_to_name[code] = str(v)
                 except Exception:
-                    # skip invalid values
-                    continue
-                shapes.append((row.geometry, crop_class_value))
+                    name = str(v).strip()
+                    code = class_to_value.get(name)
+                    if code is None:
+                        continue
+                    shapes.append((row.geometry, code))
+                    class_to_name[code] = name
 
             if not shapes:
                 raise ValueError("No farmland polygons with valid crop_class values found")
@@ -404,17 +444,17 @@ class Raster:
     
     def reproject_rasters(
         Country_name=str,
-        clipped_dir=None,
-        output_dir=None,
+        input_dir=str,
+        output_dir=str,
         out_nodata=255,
         target_crs=None,
     ):
         """
-        Reproject clipped rasters to a target CRS without matching any reference grid.
+        Reproject rasters to a target CRS without matching any reference grid.
         
         Args:
             Country_name: Country identifier
-            clipped_dir: Path to clipped rasters directory
+            input_dir: Path to input rasters directory
             output_dir: Output root directory
             out_nodata: NoData value for output rasters
             target_crs: Target CRS (pyproj.CRS, EPSG string, or int). If None, uses source CRS.
@@ -423,21 +463,27 @@ class Raster:
             reprojected_dir: Path to output reprojected rasters directory
             reprojected_files: List of created reprojected raster paths
         """
-        
-        
-        output_root = os.path.join(Data_dir, f"02.{Country_name}_MAPSPAM_Crops") if output_dir is None else output_dir
-        reprojected_dir = os.path.join(output_root, "02.Reprojected_Rasters")
+        # output_dir = output_dir or None
+
+        # if output_dir is None:
+        #     reprojected_dir = os.path.join(Data_dir, f"02.{Country_name}_MAPSPAM_Crops", "02.Reprojected_Rasters")
+        #     default_input_dir = os.path.join(Data_dir, f"02.{Country_name}_MAPSPAM_Crops", f"01.{Country_name}_Clipped_Rasters")
+        #     input_dir = input_dir or default_input_dir
+        # else:
+        #     reprojected_dir = output_dir
+        #     input_dir = input_dir or os.path.join(output_dir, f"01.{Country_name}_Clipped_Rasters")
+
+        # os.makedirs(reprojected_dir, exist_ok=True)
+
+        reprojected_dir = output_dir
         os.makedirs(reprojected_dir, exist_ok=True)
 
-        if clipped_dir is None:
-            clipped_dir = os.path.join(output_root, f"01.{Country_name}_Clipped_Rasters")
+        if not os.path.isdir(input_dir):
+            raise FileNotFoundError(f"Input folder not found: {input_dir}")
 
-        if not os.path.isdir(clipped_dir):
-            raise FileNotFoundError(f"Clipped MAPSPAM folder not found: {clipped_dir}")
-
-        tif_files = sorted(glob.glob(os.path.join(clipped_dir, "*.tif")))
+        tif_files = sorted(glob.glob(os.path.join(input_dir, "*.tif")))
         if not tif_files:
-            raise FileNotFoundError(f"No .tif files found in: {clipped_dir}")
+            raise FileNotFoundError(f"No .tif files found in: {input_dir}")
         
         reprojected_files = []
 
@@ -1077,12 +1123,14 @@ class Map:
             cropnames_csv: str = None,
             harvested_csv: str = None,
             out_dir: str = None,
+            faostat_country_name: str = None,
+            **kwargs,
     ):
 
         """
-        This function calculates the total harvested area per crop estimated from national statistics. 
-        The function returns a .csv file with a consistent naming convention to MAPSPAM. These data are needed 
-        for the final calibration. 
+        This function calculates the total harvested area per crop estimated from national statistics.
+        It reads the FAOSTAT-wide harvested-area table by filtering for the requested country and
+        the crop names defined in CropNames.csv. These data are needed for the final calibration.
 
         Saves in out_dir (default Data/03.Final/02.Calibration):
          - National_Harvested_{Country_name}.csv
@@ -1092,7 +1140,7 @@ class Map:
         if cropnames_csv is None:
             cropnames_csv = os.path.join(Input_data, "CropNames.csv")
         if harvested_csv is None:
-            harvested_csv = os.path.join(Input_data, f"HarvestedArea{Country_name}.csv")
+            harvested_csv = os.path.join(Input_data, "FAOSTAT_HarvestedArea2020.csv")
         if out_dir is None:
             out_dir = os.path.join(Data_dir, "03.Final", "02.Calibration")
         os.makedirs(out_dir, exist_ok=True)
@@ -1101,6 +1149,31 @@ class Map:
             raise FileNotFoundError(f"Crop names CSV not found: {cropnames_csv}")
         if not os.path.exists(harvested_csv):
             raise FileNotFoundError(f"Harvested area CSV not found: {harvested_csv}")
+
+        if faostat_country_name is None:
+            faostat_country_name = kwargs.pop("FAOSTAT_country_name", None)
+        if faostat_country_name is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "FAOSTAT_country_name" in caller.f_locals:
+                        faostat_country_name = caller.f_locals["FAOSTAT_country_name"]
+                        break
+                    if "FAOSTAT_country_name" in caller.f_globals:
+                        faostat_country_name = caller.f_globals["FAOSTAT_country_name"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+
+        if faostat_country_name is None:
+            raise ValueError(
+                "FAOSTAT country name was not provided. Define FAOSTAT_country_name in the User Settings."
+            )
+        faostat_country_name = str(faostat_country_name).strip()
+        if not faostat_country_name:
+            raise ValueError("FAOSTAT country name cannot be empty.")
 
         crop_map = pd.read_csv(cropnames_csv, dtype=str).fillna("")
         if {"Crop", "MAPSPAM"}.issubset(set(crop_map.columns)):
@@ -1112,23 +1185,42 @@ class Map:
         mapping["Crop"] = mapping["Crop"].astype(str).str.strip()
         mapping["MAPSPAM"] = mapping["MAPSPAM"].astype(str).str.upper().str.strip()
 
+        def _normalize_crop_name(crop_name):
+            return re.sub(r"[^0-9a-z]+", "", str(crop_name).strip().lower())
+
+        mapping["Crop_norm"] = mapping["Crop"].map(_normalize_crop_name)
+
         harvested = pd.read_csv(harvested_csv, dtype=str).fillna("")
-        if "Crop" in harvested.columns:
-            crop_col = "Crop"
-            value_col = next((c for c in harvested.columns if c != "Crop"), None)
-        else:
-            crop_col = harvested.columns[0]
-            value_col = harvested.columns[1] if len(harvested.columns) > 1 else None
 
-        if value_col is None:
-            raise ValueError(f"Harvested CSV must contain crop name and area columns: {harvested_csv}")
+        def _normalize_col_name(col_name):
+            return str(col_name).strip().lower().replace(" ", "")
 
-        harvested = harvested[[crop_col, value_col]].copy()
+        cols_lookup = {_normalize_col_name(c): c for c in harvested.columns}
+        area_col = cols_lookup.get("area")
+        item_col = cols_lookup.get("item")
+        value_col = cols_lookup.get("value")
+
+        if area_col is None or item_col is None or value_col is None:
+            raise ValueError(
+                f"Harvested CSV must contain 'Area', 'Item' and 'Value' columns: {harvested_csv}"
+            )
+
+        country_mask = harvested[area_col].astype(str).str.strip().str.casefold() == faostat_country_name.casefold()
+        if not country_mask.any():
+            raise ValueError(
+                f"Country '{faostat_country_name}' was not found in the FAOSTAT harvest file '{harvested_csv}'. Please check the FAOSTAT_country_name input."
+            )
+
+        harvested = harvested.loc[country_mask, [item_col, value_col]].copy()
         harvested.columns = ["Crop", "Area"]
         harvested["Crop"] = harvested["Crop"].astype(str).str.strip()
-        harvested["Area"] = pd.to_numeric(harvested["Area"].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
+        harvested["Crop_norm"] = harvested["Crop"].map(_normalize_crop_name)
+        harvested["Area"] = pd.to_numeric(
+            harvested["Area"].astype(str).str.replace(",", ""),
+            errors="coerce",
+        ).fillna(0.0)
 
-        merged = harvested.merge(mapping, on="Crop", how="left")
+        merged = harvested.merge(mapping[["Crop_norm", "MAPSPAM"]], on="Crop_norm", how="left")
         if merged["MAPSPAM"].isna().any():
             missing = merged.loc[merged["MAPSPAM"].isna(), "Crop"].unique()
             if len(missing) > 0:
