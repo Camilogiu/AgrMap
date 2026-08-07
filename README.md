@@ -35,7 +35,7 @@ conda activate BaseMap
 The workflow consists of eight main steps:
 
 1. Creating the base cropland layer. 
-2. Adding farmland information.
+2. Adding farmland information. 
 3. Processing MAPSPAM's crop rasters. 
 4. Calculating the share of irrigated area. 
 5. Generate Density rasters.
@@ -53,37 +53,59 @@ Data/
 ```
 
 ---
+# The notebooks
 
+In this repository there are two notebooks: 
+* BaseMap.jpynb
+* FarmlandClassification.jpynb
+
+The main notebook is BaseMap.jpynb. FarmlandClassification.jpynb is used to classify Open Street Map's data on farmlands. OSM provides vector polygons with farmlands, specifying the crop-type and if it is irrigated or not. The polygon has to be reclassified by the user in order to follow **the same naming convention of MAPSPAM**.
+
+Follow the guidelined on FarmlandClassification.jpynb to download OSM data and run the notebook to  re-classify OSM farmland polygons. 
+
+---
 # Input Data
 
-Create a folder in the Data one named:
+In the Data disrectory there is a folder named:
 
 ```text
 00.InputData/
 ```
+In this folder you will find already: 
+* MAPSPAM crop rasters developed by the International Food Policy Research Institute (IFPRI) in a folder name spam2020v2r2 sourced from https://www.mapspam.info/data/ 
+* National agricultural statistics from FAOSTAT, sourced from https://www.fao.org/faostat/en/#data/QCL . FAOSTAT csv files quantify global harvested aread divided by country and crop for the year 2020. 
+* Two look-up tables called CropNames.csv and GAEZ_crop_code to ensure consistency across different naming conventions used for crops.
 
-The folder should contain:
+Additionally, add the following country-specific data: 
+
 
 ## Spatial Data
 
-* Country boundary shapefile: https://gadm.org/download_country.html
-* Land cover raster
-In the test folder we used Copernicus Global Land Cover dataset (2022), accessed through the QGIS Copernicus plugin; classification based on the UN FAO Land Cover Classification System (LCCS).
-* OSM farmland layer, accessed through the QGIS OSM plugin.
-* MAPSPAM crop rasters developed by the International Food Policy Research Institute (IFPRI): https://www.mapspam.info/data/ 
+* Country boundary shapefile named as *gadm41_{Country_name}*: https://gadm.org/download_country.html
 
-
+For instance for Zambia it is gadm41_ZMB.shp
 Note: make sure the country boundary shapefile has the same reference system as MAPSPAM (EPSG:4326 (WGS 84))
 
-## Statistical Data
+* Land cover raster
+This raster should be put inside a folder named *Land Cover* and named as *{Country_name}_LandCover*. For instance for Zambia we used *ZMB_LandCover*.  In the test folder we used Copernicus Global Land Cover dataset (2020), accessed through the QGIS Copernicus plugin. The same dataset can be downloaded from https://cds.climate.copernicus.eu/datasets/satellite-land-cover?tab=overview 
 
-* National agricultural statistics from FAOSTAT: https://www.fao.org/faostat/en/#data/QCL
+The land cover classification is based on the UN FAO Land Cover Classification System (LCCS).
 
-MAPSPAM data are calibrated for 2020. In our case-study country, harvested area estimates vary considerably between years due to differences in assumptions, sensing systems, climate hazards (e.g., droughts and floods), and statistical sources. As a result, harvested areas may increase or decrease over time. To minimize additional uncertainty and ensure methodological consistency, we used the same dataset (sourced from FAOSTA) used by the the IFPRI institute for downscaling raw data. The FAOSTAT database has been used for the final calibration of and crop spatial allocation in step 7. 
+* OSM farmland layer, accessed through the QGIS OSM plugin and renamed as *OSM_farmland*. See more information on how to download OSM data on the FarmalandClassification Jupyter Notebook.
 
-## The country name
+---
+# User Settings 
+The first cell in BaseMap.jpynb is called *User Settings*. There the user will have to specify: 
 
-Make sure that you are consistent with the "Country_name" in the input data files and the one used for running the notebook. We recommend using the the ISO 3166-1 alpha-3 codes that you can find here: https://www.iso.org/obp/ui/#search/code/ 
+* Country_name: this has to be consistent with the country_name used in your input data. Make sure that you are consistent with the "Country_name" in the input data files and the one used for running the notebook. We recommend using the the ISO 3166-1 alpha-3 codes that you can find here: https://www.iso.org/obp/ui/#search/code/ 
+
+* FAOSTAT_country_name: In the FAOSTAT_HarvestedArea2020.csv file, there is a column called *Area* where there are listed all countries covered by FAOSTAT. If you are unsure about the naming convention, look for your country of interest and write its name in FAOSTAT_country_name. 
+
+* cropland_value : this represents the value used for cropland in your land cover raster.
+
+* SSP and Climate_model : these data are needed for downloading crop water demand from the Global Agro Ecolgical Zone (GAEZ) dataset v5. See more details on the notebook. 
+
+* Coordinate and projection systems: use projected coordinate reference system (projected CRS in meters).
 
 
 ## Lookup Tables
@@ -101,13 +123,7 @@ Example:
 | Maize      | MAIZ         |
 | Millet     | MILL         |
 
-### Farmland Legend
 
-OSM provides vector polygons with farmlands, specifying the crop-type and if it is irrigated or not. The polygon has to be reclassified by the user. The user has to create a {Country_name}Farmlands.csv file that serves as a legend for classifying high mechanized cropland. An example for the case study of Zambia can be found in the test folder. The .csv file has this format: 
-| Farmland | Class |
-| MAIZ_HI  | 1     |
-
-Note that the farmland names have to follow the same naming convention of MAPSPAM.
 
 ## Test
 
@@ -121,6 +137,7 @@ Before running the notebook, check the test folder available on Zenodo https://z
 This serves as a base layer for the analysis. It is used as a proxy for downscaling crops' harvested area statistics and faming-system's data available at higher resolution.
 ### Processing
 
+* Reproject land cover 
 * Reclassify the land cover raster
 * Convert crop-specific rasters to binary rasters:
 
@@ -147,12 +164,12 @@ Where the .gpkg file represents the final point vector with cropland.
 ---
 
 ## Step 2 – Add Farmland Information
-Open Street Map provides shapefiles of farmlands. This is used as a proxy for high-input crops.
+Open Street Map provides shapefiles of farmlands. This is used as a proxy for high-input crops. Before running this step on BaseMap.jpynb, run **FarmlandClassification.jpynb** and follow the instructions there to create crop classes with the same naming convention as the IFPRI dataset. 
 ### Processing
 
 * Add X and Y coordinates to each point
 * Overlay OSM farmland polygons
-* Create a farmland indicator column with the Farmland "Class numbers" consistent with the reclassification done from OSM data and the Farmland legend .csv file.
+* Create a farmland indicator column with the Farmland classes created in the FarmlandClassification.jpynb
 
 ### Output
 
