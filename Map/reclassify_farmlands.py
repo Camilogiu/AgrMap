@@ -7,34 +7,6 @@ import geopandas as gpd
 import pandas as pd
 
 
-DEFAULT_MAPPING: Dict[str, Tuple[Optional[str], Optional[str]]] = {
-    "sugarcane": ("SUGC_HI", "SUGC_HR"),
-    "wheat": ("WHEA_HI", "WHEA_HI"),
-    "soy": ("SOYB_HI", "SOYB_HR"),
-    "soybean": ("SOYB_HI", "SOYB_HR"),
-    "maize": ("MAIZ_HI", "MAIZ_HR"),
-    "corn": ("MAIZ_HI", "MAIZ_HR"),
-    "banana": ("BANA_HI", "BANA_HR"),
-    "cassava": ("CASS_HI", "CASS_HR"),
-    "coffee": ("COFF_HI", "COFF_HR"),
-    "palm oil": ("SUNF_HR", "SUNF_HR"),
-    "palm": ("SUNF_HR", "SUNF_HR"),
-    "cereal": ("MILL_HI", "MILL_HR"),
-    "vegetable": ("VEGE_HI", "VEGE_HR"),
-    "vegetables": ("VEGE_HI", "VEGE_HR"),
-    "vegetable;rape;vegetables;Papaya;mango;Guave": ("VEGE_HI", "VEGE_HR"),
-    "wheat, soybean": ("WHEA_HI", "SOYB_HR"),
-    "wheat,soyabean": ("WHEA_HI", "SOYB_HR"),
-    "wheat, soyabean": ("WHEA_HI", "SOYB_HR"),
-    "wheat; soybean": ("WHEA_HI", "SOYB_HR"),
-    "wheat;soy bean": ("WHEA_HI", "SOYB_HR"),
-    "wheat, soya": ("WHEA_HI", "SOYB_HR"),
-    "wheat;soy": ("WHEA_HI", "SOYB_HR"),
-    "wheat;soybean": ("WHEA_HI", "SOYB_HR"),
-    None: ("Other_HI", "Other_HR"),
-}
-
-
 def _normalize_key(s: str) -> str:
     s2 = s.strip().lower()
     # normalize repeated spaces
@@ -42,59 +14,58 @@ def _normalize_key(s: str) -> str:
     return s2
 
 
-def list_unique_crop(input_dir: str, input_shp: str = "OSM_farmland.shp") -> List[str]:
-    """Read the shapefile and return a sorted list of unique values in the `crop` column.
+def list_unique_crop(input_dir: str, input_shp: str = "OSM_farmland.shp", field: str = "crop") -> List[str]:
+    """Read the shapefile and return a sorted list of unique values in the `field` column.
 
     Args:
         input_dir: folder containing the shapefile.
         input_shp: shapefile name (default: OSM_farmland.shp).
+        field: column to list (default: "crop"; use "crop_class" on farmlands_reclassified.shp).
 
     Returns:
-        Sorted list of unique crop strings (as they appear in the attribute table).
+        Sorted list of unique strings (as they appear in the attribute table).
     """
     path = os.path.join(input_dir, input_shp)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Shapefile not found: {path}")
 
     gdf = gpd.read_file(path)
-    if "crop" not in gdf.columns:
-        raise KeyError("'crop' column not found in shapefile")
+    if field not in gdf.columns:
+        raise KeyError(f"'{field}' column not found in shapefile")
 
-    vals = gdf["crop"].dropna().astype(str).map(lambda x: x.strip()).unique().tolist()
+    vals = gdf[field].dropna().astype(str).map(lambda x: x.strip()).unique().tolist()
     vals_sorted = sorted(vals, key=lambda s: s.lower())
     return vals_sorted
 
 
 def reclassify_farmlands(input_dir: str,
+                         mapping: Dict[Optional[str], Tuple[Optional[str], Optional[str]]],
                          input_shp: str = "OSM_farmland.shp",
                          output_shp: str = "farmlands_reclassified.shp",
-                         mapping: Dict[str, Tuple[Optional[str], Optional[str]]] = None,
                          crop_field: str = "crop",
                          irrigation_field: str = "irrigation",
                          output_field: str = "crop_class",
-                         unknown_value: Optional[str] = None) -> gpd.GeoDataFrame:
+                         unknown_value: Optional[str] = None,
+                         irrigated_keywords: Tuple[str, ...] = ("pivot",)) -> gpd.GeoDataFrame:
     """Reclassify farmland polygons into `crop_class` based on `crop` and `irrigation`.
-
-    Behavior:
-    - Tries an exact, case-insensitive match of the entire `crop` string against keys in `mapping`.
-    - If no exact match, tokenizes the `crop` value on commas/semicolons and tries each token.
-    - If still no match, attempts per-word matching inside tokens.
-    - Determines pivot status by checking whether the `irrigation` column contains the substring 'pivot' (case-insensitive).
 
     Args:
         input_dir: folder containing the input shapefile.
+        mapping: dict mapping crop strings -> (irrigated_class, rainfed_class), defined by the
+            user in FarmlandClassification.ipynb (USER_MAPPING). The key None is used for
+            polygons with an empty crop field.
         input_shp: input shapefile filename.
         output_shp: output shapefile filename to write inside `input_dir`.
-        mapping: dict mapping normalized crop strings -> (pivot_class, nonpivot_class). If None, uses DEFAULT_MAPPING.
         crop_field: name of the crop column.
         irrigation_field: name of the irrigation column.
         output_field: name of the new column to create.
         unknown_value: value to use when no mapping found (default: None).
+        irrigated_keywords: substrings in `irrigation_field` that mark a polygon as irrigated
+            (default: ("pivot",)).
 
     Returns:
         The GeoDataFrame with the new `output_field` column (and also writes a shapefile).
     """
-    mapping = mapping or DEFAULT_MAPPING
     none_mapping = mapping.get(None)
     mapping_norm = {}
     for k, v in mapping.items():
@@ -112,10 +83,13 @@ def reclassify_farmlands(input_dir: str,
     if irrigation_field not in gdf.columns:
         warnings.warn(f"'{irrigation_field}' column not found; treating as non-pivot for all rows")
 
+    keywords = [k.lower() for k in irrigated_keywords]
+
     def _is_pivot(irrig_val) -> bool:
         if pd.isna(irrig_val):
             return False
-        return "pivot" in str(irrig_val).lower()
+        val = str(irrig_val).lower()
+        return any(k in val for k in keywords)
 
     def _resolve(s_crop: str, irrig_val) -> Optional[str]:
         if s_crop is None or (isinstance(s_crop, float) and pd.isna(s_crop)):
@@ -166,20 +140,3 @@ def reclassify_farmlands(input_dir: str,
         raise RuntimeError(f"Failed to write output shapefile {out_path}: {e}")
 
     return gdf
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input_dir", help="Folder containing OSM_farmland.shp")
-    args = parser.parse_args()
-
-    print("Listing crop:")
-    crop = list_unique_crop(args.input_dir)
-    for c in crop:
-        print(" -", c)
-
-    print("Reclassifying and writing farmlands_reclassified.shp...")
-    gdf_out = reclassify_farmlands(args.input_dir)
-    print("Done. Rows:", len(gdf_out))
