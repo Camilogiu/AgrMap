@@ -3,6 +3,7 @@ import glob
 import inspect
 import re
 import shutil
+import tempfile
 import requests
 import pandas as pd
 import numpy as np
@@ -16,6 +17,7 @@ import rasterio.transform
 from rasterio.mask import mask
 from rasterio.warp import reproject, Resampling
 from pyproj import CRS
+from scipy.spatial import cKDTree
 
 ROOT_DIR = os.path.abspath(os.curdir)
 Data_dir = os.path.join(ROOT_DIR, "Data")
@@ -28,7 +30,7 @@ class Raster:
         """
         This class contains all the methods needed for reclassifying,
         clipping, reprojecting, converting and filtering all the rasters
-        used for the analysis. This class is used to run the steps 1-5 of the notebook. 
+        used for the analysis. 
 
         """
 
@@ -42,8 +44,9 @@ class Raster:
             Path to input raster. If None, the first .tif found in input_dir is used.
         output_dir : str
             Directory where the reclassified raster will be saved.
-        cropland_value : int
-            Pixel value representing cropland in the input raster.
+        cropland_value : int, list, or tuple
+            Pixel value(s) representing cropland in the input raster.
+            Can be a single value (e.g., 1) or multiple values (e.g., [10, 11] or (10, 11)).
         out_nodata : int
             Nodata value for the output raster.
 
@@ -52,6 +55,10 @@ class Raster:
         str
             Path to the output raster.
         """
+        # Ensure cropland_value is a list for flexible handling of single or multiple values
+        if cropland_value is not None and not isinstance(cropland_value, (list, tuple)):
+            cropland_value = [cropland_value]
+        
         if input_raster is None:
             tif_files = sorted(glob.glob(os.path.join(Input_data, "*.tif")))
             if not tif_files:
@@ -65,7 +72,9 @@ class Raster:
             src_nodata = src.nodata
 
             out = np.zeros_like(data, dtype=np.uint8)
-            out[data == cropland_value] = 1
+            # Use np.isin() to handle single or multiple cropland values
+            if cropland_value is not None:
+                out[np.isin(data, cropland_value)] = 1
 
             if src_nodata is not None:
                 out[data == src_nodata] = out_nodata
@@ -152,120 +161,356 @@ class Raster:
         if os.path.exists(out_fp):
             os.remove(out_fp)
         
-        gdf.to_file(out_fp, driver="GPKG")
+        gdf.to_file(
+            out_fp,
+            driver="GPKG",
+            layer=Country_name,
+            layer_options={"SPATIAL_INDEX": "NO"},
+            engine="fiona",
+        )
         
         print(f"Saved point vector: {os.path.basename(out_fp)} with {len(gdf)} points")
-        
+
         return [out_fp]
-    
-    def rasterize_farmlands(
-        Country_name=str,
-        reference_raster=None,
-        farmland_shapefile=None,
-        #class_lookup_csv=None,
-        target_vector=None,
-        output_dir=None,
-        out_nodata=255,
-        target_layer=None,
+
+    def validate_cropland_feasibility(
+            Country_name=str,
+            FAOSTAT_country_name=str,
+            cropland_value=None,
+            land_cover_raster=None,
+            harvested_csv=None,
     ):
         """
-        Rasterize farmland polygons to the same grid as the reference land cover raster,
-        then sample those values on an existing GeoPackage and add a "farms" column.
+        Sanity-check the land cover raster against FAOSTAT before running the rest of the
+        pipeline. For each cropland_value, prints the pixel count/area, compares the total
+        cropland area in the raster against the national FAOSTAT harvested area, and warns
+        if the raster doesn't have enough cropland capacity to hold it (a prerequisite for
+        Step 7 calibration/redistribution to succeed without raising an error).
 
-        Missing/no-farm pixels will have "NoFarm" in the 'farms' column.
+        Parameters
+        ----------
+        Country_name : str
+        FAOSTAT_country_name : str
+            Passed through to Map.calculate_national_statistics.
+        cropland_value : int or sequence of int
+            Land cover pixel value(s) considered cropland (the 'cropland_value' User Setting).
+        land_cover_raster : str, optional
+            Defaults to Input_data/{Country_name}_LandCover.tif.
+        harvested_csv : str, optional
+            Passed through to Map.calculate_national_statistics (which FAOSTAT CSV to use).
+
+        Returns
+        -------
+        dict with keys: total_area_ha, faostat_total_ha, ratio, passed (bool or None if the
+        National_harvested_{Country_name}.csv could not be found/read).
         """
+        if land_cover_raster is None:
+            land_cover_raster = os.path.join(Input_data, f'{Country_name}_LandCover.tif')
+        if cropland_value is None:
+            raise ValueError("cropland_value must be provided (the land cover pixel value(s) treated as cropland).")
+
+        print("\n" + "=" * 70)
+        print(f"CROPLAND VALIDATION FOR {Country_name}".center(70))
+        print("=" * 70)
+
+        with rasterio.open(land_cover_raster) as src:
+            data = src.read(1)
+            transform = src.transform
+
+            pixel_width = abs(transform.a)
+            pixel_height = abs(transform.e)
+            pixel_area_m2 = pixel_width * pixel_height
+
+            cropland_values = cropland_value if isinstance(cropland_value, (list, tuple)) else [cropland_value]
+
+            print(f"\nPixel size: {pixel_width:.1f}m × {pixel_height:.1f}m = {pixel_area_m2:,.0f} m²")
+            print(f"Cropland values to check: {cropland_values}\n")
+
+            total_pixels = 0
+            total_area_m2 = 0
+
+            for value in cropland_values:
+                pixel_count = np.sum(data == value)
+                area_m2 = pixel_count * pixel_area_m2
+                area_ha = area_m2 / 10000
+                total_pixels += pixel_count
+                total_area_m2 += area_m2
+                print(f"  Cropland value {value}: {pixel_count:,} pixels = {area_ha:>12,.0f} ha ({area_m2:.2e} m²)")
+
+            total_area_ha = total_area_m2 / 10000
+            print(f"\n  {'TOTAL FROM RASTER':.<30} {total_pixels:>15,} pixels = {total_area_ha:>12,.0f} ha ({total_area_m2:.2e} m²)")
+
+        print(f"\nReading FAOSTAT data for {FAOSTAT_country_name}...")
+        result = {"total_area_ha": total_area_ha, "faostat_total_ha": None, "ratio": None, "passed": None}
+
+        # Use a scratch directory so this early sanity check doesn't create 03.Final/ or
+        # leave behind National_*_{Country_name}.csv files before Step 7 actually runs.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            Map.calculate_national_statistics(
+                Country_name=Country_name,
+                faostat_country_name=FAOSTAT_country_name,
+                harvested_csv=harvested_csv,
+                out_dir=tmp_dir,
+            )
+            national_csv_path = os.path.join(tmp_dir, f"National_harvested_{Country_name}.csv")
+            national_df = pd.read_csv(national_csv_path) if os.path.exists(national_csv_path) else None
+
+        if national_df is not None:
+
+            area_col = None
+            for col in national_df.columns:
+                if 'area' in col.lower():
+                    area_col = col
+                    break
+            if area_col is None:
+                area_col = national_df.columns[1]
+
+            faostat_total_ha = national_df[area_col].sum()
+            faostat_total_m2 = faostat_total_ha * 10000
+
+            print(f"  {'TOTAL FROM FAOSTAT':.<30} {faostat_total_ha:>12,.0f} ha ({faostat_total_m2:.2e} m²)")
+            print("\n" + "=" * 70)
+
+            ratio = total_area_m2 / faostat_total_m2 if faostat_total_m2 > 0 else 0
+            passed = total_area_m2 >= faostat_total_m2
+
+            if passed:
+                print("✓ VALIDATION PASSED")
+                print(f"  Raster area is {ratio:.2%} of FAOSTAT total (≥100%)")
+                print("  ➜ Crop calibration is FEASIBLE")
+            else:
+                print("✗ VALIDATION WARNING")
+                print(f"  Raster area is only {ratio:.2%} of FAOSTAT total (<100%)")
+                print("  ➜ Crop calibration may be UNFEASIBLE")
+                print("\n  Recommendations:")
+                print("  1. Consider using a more up-to-date land cover map")
+                print("  2. Try different cropland_value(s) that better represent actual cropland")
+                print("  3. Check if the land cover raster aligns with your study area")
+
+            print("=" * 70 + "\n")
+
+            result.update({"faostat_total_ha": faostat_total_ha, "ratio": ratio, "passed": passed})
+        else:
+            print(f"Warning: National_harvested_{Country_name}.csv could not be generated from the FAOSTAT data.")
+
+        return result
+
+    def create_subnational_shapefile(
+            Country_name=str,
+            admin_shapefile=None,
+            target_crs=None,
+            output_dir=None,
+            admin_level: int = None,
+    ):
+        """
+        Builds the SubNational_reprojected.shp used downstream (rasterize_admin_boundaries,
+        mapspam_filter_crops's admin-level pass, SubNationalStat.ipynb) from a raw admin
+        boundary shapefile.
+
+        admin_level (or the notebook's Calibration_method, read automatically if admin_level
+        is not passed) selects the default input file and which columns are kept:
+         - 0: nothing to do (no sub-national calibration); prints a message and returns None.
+         - 1 or 2: admin_shapefile defaults to Input_data/{country_name_lower}_admin{admin_level}.shp
+           (e.g. 'zmb_admin2.shp' for Country_name='ZMB', admin_level=2).
+           Columns kept: 'adm1_name' always, plus 'adm2_name' if admin_level > 1, plus the
+           area column (named 'area_sqkm' in the source files seen so far — kept under that
+           name, not renamed to 'area', since rasterize_admin_boundaries/mapspam_filter_crops
+           already de-duplicate on 'area_sqkm'), 'center_lat', 'center_lon', and 'geometry'.
+
+        target_crs : optional
+            Defaults to the notebook's 'crs_proj' (read automatically from the caller's scope
+            if not passed), the projected CRS used throughout the pipeline.
+
+        Writes Input_data/SubNational_reprojected.shp.
+
+        Returns the output shapefile path, or None if admin_level is 0.
+        """
+        if admin_level is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "Calibration_method" in caller.f_locals:
+                        admin_level = caller.f_locals["Calibration_method"]
+                        break
+                    if "Calibration_method" in caller.f_globals:
+                        admin_level = caller.f_globals["Calibration_method"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+        admin_level = int(admin_level) if admin_level is not None else 0
+
+        if admin_level <= 0:
+            print("Calibration_method is 0 (adm0); no sub-national shapefile needed, skipping.")
+            return None
+
+        if output_dir is None:
+            output_dir = Input_data
+        os.makedirs(output_dir, exist_ok=True)
+
+        if admin_shapefile is None:
+            admin_shapefile = os.path.join(Input_data, f"{Country_name.lower()}_admin{admin_level}.shp")
+        if not os.path.exists(admin_shapefile):
+            raise FileNotFoundError(
+                f"Admin boundary shapefile not found: {admin_shapefile}. Calibration_method "
+                f"is set to {admin_level} — check that it matches the admin level of the "
+                f"shapefile you added, or adjust Calibration_method/admin_shapefile."
+            )
+
+        if target_crs is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "crs_proj" in caller.f_locals:
+                        target_crs = caller.f_locals["crs_proj"]
+                        break
+                    if "crs_proj" in caller.f_globals:
+                        target_crs = caller.f_globals["crs_proj"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+        if target_crs is None:
+            raise ValueError("target_crs was not provided and 'crs_proj' was not found in the caller's scope.")
+
+        admin = gpd.read_file(admin_shapefile)
+
+        cols_lower = {c.lower(): c for c in admin.columns}
+        area_col = cols_lower.get("area_sqkm", cols_lower.get("area"))
+        keep_cols = ["adm1_name"]
+        if admin_level > 1:
+            keep_cols.append("adm2_name")
+        for required in [area_col, "center_lat", "center_lon"]:
+            if required is None or required not in admin.columns:
+                raise ValueError(
+                    f"Expected columns 'adm1_name'"
+                    f"{', adm2_name' if admin_level > 1 else ''}, 'area_sqkm'/'area', "
+                    f"'center_lat', 'center_lon' in {admin_shapefile}; found {admin.columns.tolist()}"
+                )
+        keep_cols += [area_col, "center_lat", "center_lon"]
+
+        missing = [c for c in keep_cols if c not in admin.columns]
+        if missing:
+            raise ValueError(f"Missing expected column(s) {missing} in {admin_shapefile}")
+
+        admin = admin[keep_cols + ["geometry"]].copy()
+        admin = admin.to_crs(target_crs)
+
+        output_fp = os.path.join(output_dir, "SubNational_reprojected.shp")
+        if os.path.exists(output_fp):
+            for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qmd"):
+                leftover = os.path.splitext(output_fp)[0] + ext
+                if os.path.exists(leftover):
+                    os.remove(leftover)
+        admin.to_file(output_fp)
+
+        print(f"Saved: {output_fp}")
+        return output_fp
+
+    def rasterize_admin_boundaries(
+            Country_name=str,
+            reference_raster=None,
+            admin_shapefile=None,
+            target_vector=None,
+            output_dir=None,
+            out_nodata=255,
+            admin_level: int = None,
+    ):
+        """
+        Rasterize the sub-national admin boundaries (SubNational_reprojected.shp, produced by
+        create_subnational_shapefile) onto the same grid as the reclassified cropland raster,
+        then sample those values onto an existing GeoPackage and add an 'adm{admin_level}_name'
+        column — mirrors how rasterize_farmlands rasterizes farmland polygons and samples them
+        onto points to create the 'farms' column.
+
+        admin_level (or the notebook's Calibration_method, read automatically if admin_level
+        is not passed):
+         - 0: nothing to do; prints a message and returns None.
+         - 1 or 2: uses 'adm1_name' or 'adm2_name' respectively as the admin column read from
+           admin_shapefile, and writes the result to a column named 'adm1_name' or
+           'adm2_name' on the output points (named dynamically as f"adm{admin_level}_name").
+
+        Parameters
+        ----------
+        Country_name : str
+        reference_raster : str, optional
+            Defaults to Data/01.BaseCroplandLayer/{Country_name}_reclassified_nod.tif.
+        admin_shapefile : str, optional
+            Defaults to Input_data/SubNational_reprojected.shp.
+        target_vector : str, optional
+            Defaults to Data/01.BaseCroplandLayer/{Country_name}.gpkg (the Step 1 points layer).
+        output_dir : str, optional
+            Defaults to Data/01.BaseCroplandLayer.
+        out_nodata : int
+            Value written where no admin polygon covers a pixel; points sampled there get a
+            missing (NaN) adm{admin_level}_name.
+
+        Writes:
+         - {Country_name}_adm.tif   (int16 raster of admin codes; intermediate)
+         - {Country_name}_adm.gpkg  (target_vector's points + 'adm{admin_level}_name')
+
+        Returns the output GeoPackage path, or None if admin_level is 0.
+        """
+        if admin_level is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "Calibration_method" in caller.f_locals:
+                        admin_level = caller.f_locals["Calibration_method"]
+                        break
+                    if "Calibration_method" in caller.f_globals:
+                        admin_level = caller.f_globals["Calibration_method"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+        admin_level = int(admin_level) if admin_level is not None else 0
+
+        if admin_level <= 0:
+            print("Calibration_method is 0 (adm0); no admin boundaries to rasterize, skipping.")
+            return None
+
         output_dir = os.path.join(Data_dir, "01.BaseCroplandLayer") if output_dir is None else output_dir
         os.makedirs(output_dir, exist_ok=True)
 
         if reference_raster is None:
-            reference_raster = os.path.join(Input_data, f"{Country_name}_LandCover.tif")
-        if farmland_shapefile is None:
-            farmland_shapefile = os.path.join(Input_data, f"farmlands_reclassified.shp")
-        # if class_lookup_csv is None:
-        #     class_lookup_csv = os.path.join(Input_data, f"{Country_name}Farmlands.csv")
+            reference_raster = os.path.join(output_dir, f"{Country_name}_reclassified_nod.tif")
+        if admin_shapefile is None:
+            admin_shapefile = os.path.join(Input_data, "SubNational_reprojected.shp")
         if target_vector is None:
             target_vector = os.path.join(output_dir, f"{Country_name}.gpkg")
 
         if not os.path.exists(reference_raster):
             raise FileNotFoundError(f"Reference raster not found: {reference_raster}")
-        if not os.path.exists(farmland_shapefile):
-            raise FileNotFoundError(f"Farmland shapefile not found: {farmland_shapefile}")
-        # if not os.path.exists(class_lookup_csv):
-        #     raise FileNotFoundError(f"Lookup CSV not found: {class_lookup_csv}")
+        if not os.path.exists(admin_shapefile):
+            raise FileNotFoundError(f"Admin boundary shapefile not found: {admin_shapefile}")
         if not os.path.exists(target_vector):
             raise FileNotFoundError(f"Target vector not found: {target_vector}")
 
-        # # read lookup (expects columns "Farmland" and "Class")
-        # lookup = pd.read_csv(class_lookup_csv, dtype=str)
-        # try:
-        #     class_to_name = {int(row["Class"]): row["Farmland"] for _, row in lookup.iterrows()}
-        # except Exception:
-        #     # tolerant fallback: try swapped column names
-        #     class_to_name = {int(row["Class"]): row.get("Farmland", "") for _, row in lookup.iterrows()}
+        admin_col = "adm2_name" if admin_level > 1 else "adm1_name"
 
-        farmlands = gpd.read_file(farmland_shapefile)
         with rasterio.open(reference_raster) as src:
-            if farmlands.crs != src.crs:
-                farmlands = farmlands.to_crs(src.crs)
+            admin = gpd.read_file(admin_shapefile)
+            if admin.crs != src.crs:
+                admin = admin.to_crs(src.crs)
 
-            # Build mapping from string crop_class names -> integer raster codes.
-            # Support three cases:
-            #  - crop_class already numeric (int) -> keep as-is
-            #  - crop_class string -> assign deterministic int code
-            #  - None / NaN -> ignored
-            existing_ints = set()
-            string_names = []
-            for _, row in farmlands.iterrows():
-                v = row.get("crop_class", None)
-                if v is None or (isinstance(v, float) and pd.isna(v)):
-                    continue
-                # detect numeric-like values
-                try:
-                    iv = int(v)
-                    existing_ints.add(int(iv))
-                except Exception:
-                    s = str(v).strip()
-                    if s not in string_names:
-                        string_names.append(s)
+            if admin_col not in admin.columns:
+                raise ValueError(f"'{admin_col}' column not found in {admin_shapefile}")
 
-            # assign integer codes for string names, avoiding collisions with existing ints and nodata
-            start_code = 1
-            if existing_ints:
-                start_code = max(existing_ints) + 1
+            # drop any exact duplicate rows before rasterizing
+            dedup_cols = [c for c in ["adm2_name", "adm1_name", "area_sqkm"] if c in admin.columns]
+            admin = admin.drop_duplicates(subset=dedup_cols).reset_index(drop=True)
+            admin["admin_code"] = admin.index.astype(int) + 1  # avoid 0, reserved for out_nodata
+            class_to_name = dict(zip(admin["admin_code"], admin[admin_col]))
 
-            class_to_value = {}
-            next_code = start_code
-            for name in sorted(string_names, key=lambda x: x.lower()):
-                class_to_value[name] = next_code
-                next_code += 1
+            shapes = list(zip(admin.geometry, admin["admin_code"]))
 
-            # Build shapes list using either existing numeric code or assigned code
-            shapes = []
-            class_to_name = {}
-            for _, row in farmlands.iterrows():
-                v = row.get("crop_class", None)
-                if v is None or (isinstance(v, float) and pd.isna(v)):
-                    continue
-                try:
-                    code = int(v)
-                    shapes.append((row.geometry, code))
-                    # keep name mapping if geometry had a string label stored elsewhere
-                    class_to_name[code] = str(v)
-                except Exception:
-                    name = str(v).strip()
-                    code = class_to_value.get(name)
-                    if code is None:
-                        continue
-                    shapes.append((row.geometry, code))
-                    class_to_name[code] = name
-
-            if not shapes:
-                raise ValueError("No farmland polygons with valid crop_class values found")
-
-            out_shape = (src.height, src.width)
             rasterized = rasterize(
                 shapes,
-                out_shape=out_shape,
+                out_shape=(src.height, src.width),
                 transform=src.transform,
                 fill=out_nodata,
                 dtype=np.int16,
@@ -280,30 +525,28 @@ class Raster:
                 compress="lzw",
             )
 
-        farmland_raster_path = os.path.join(output_dir, f"{Country_name}_farmland.tif")
-        if os.path.exists(farmland_raster_path):
-            os.remove(farmland_raster_path)
-        with rasterio.open(farmland_raster_path, "w", **raster_meta) as dst:
+        admin_raster_fp = os.path.join(output_dir, f"{Country_name}_adm.tif")
+        if os.path.exists(admin_raster_fp):
+            os.remove(admin_raster_fp)
+        with rasterio.open(admin_raster_fp, "w", **raster_meta) as dst:
             dst.write(rasterized, 1)
+        print(f"Saved admin raster: {os.path.basename(admin_raster_fp)}")
 
-        # read target vector and ensure same CRS
-        target_gdf = gpd.read_file(target_vector, layer=target_layer) if target_layer else gpd.read_file(target_vector)
-        if target_gdf.crs != src.crs:
-            target_gdf = target_gdf.to_crs(src.crs)
+        # read target vector and sample the admin raster at each point, same pattern as
+        target_gdf = gpd.read_file(target_vector)
+        with rasterio.open(admin_raster_fp) as src:
+            if target_gdf.crs != src.crs:
+                target_gdf = target_gdf.to_crs(src.crs)
 
-        # sample using point geometries (centroid for polygons)
-        if target_gdf.geometry.geom_type.isin(["Point", "MultiPoint"]).all():
-            sample_geoms = target_gdf.geometry
-        else:
-            sample_geoms = target_gdf.geometry.centroid
+            if target_gdf.geometry.geom_type.isin(["Point", "MultiPoint"]).all():
+                sample_geoms = target_gdf.geometry
+            else:
+                sample_geoms = target_gdf.geometry.centroid
+            coords = [(geom.x, geom.y) for geom in sample_geoms]
 
-        coords = [(geom.x, geom.y) for geom in sample_geoms]
-
-        sampled_vals = []
-        with rasterio.open(farmland_raster_path) as src:
+            sampled_vals = []
             for val in src.sample(coords):
                 v = val[0]
-                # treat nodata as missing
                 if v == src.nodata or v == out_nodata or pd.isna(v):
                     sampled_vals.append(None)
                 else:
@@ -312,45 +555,271 @@ class Raster:
                     except Exception:
                         sampled_vals.append(None)
 
-        target_gdf["crop_class"] = sampled_vals
-        # map to farmland names; missing -> "NoFarm"
-        target_gdf["farms"] = target_gdf["crop_class"].map(class_to_name).where(target_gdf["crop_class"].notnull(), "NoFarm")
-        # any unmapped numeric class -> NoFarm
-        target_gdf["farms"] = target_gdf["farms"].fillna("NoFarm")
+        out_col = "adm"
+        target_gdf["admin_code"] = sampled_vals
+        target_gdf[out_col] = target_gdf["admin_code"].map(class_to_name)
+        target_gdf = target_gdf.drop(columns=["admin_code"])
 
-        # remove crop_class column before saving
-        if "crop_class" in target_gdf.columns:
-            target_gdf = target_gdf.drop(columns=["crop_class"])
+        missing_mask = target_gdf[out_col].isna()
+        n_unmatched = int(missing_mask.sum())
+        print(f"Points without a matched {admin_col}: {n_unmatched} out of {len(target_gdf)}")
 
-        output_gpkg = os.path.join(output_dir, f"{Country_name}_crp_farmland.gpkg")
-        # remove any existing (possibly corrupted) gpkg to force a clean create
+        if n_unmatched > 0:
+            # These points fall outside every admin polygon (e.g. a thin rim along the
+            # country/coast edge where the admin boundaries don't quite reach the land
+            # cover raster's extent) rather than in a sliver gap between two districts, so
+            # a normal intersects-based join can't help. Assign each one the nearest
+            # admin polygon instead, so every point ends up with a non-null adm.
+            nearest = gpd.sjoin_nearest(
+                target_gdf.loc[missing_mask, ["geometry"]],
+                admin[[admin_col, "geometry"]],
+                how="left",
+                distance_col="_dist_to_admin",
+            )
+            nearest = nearest[~nearest.index.duplicated(keep="first")]
+            target_gdf.loc[missing_mask, out_col] = nearest[admin_col].reindex(target_gdf.loc[missing_mask].index).values
+            max_dist = nearest["_dist_to_admin"].max()
+            print(f"Filled {n_unmatched} unmatched points with their nearest {admin_col} "
+                  f"(max assignment distance: {max_dist:,.0f} m).")
+
+        still_missing = int(target_gdf[out_col].isna().sum())
+        if still_missing:
+            raise ValueError(
+                f"{still_missing} points still have no '{out_col}' after nearest-district "
+                f"fallback — check that {admin_shapefile} has valid, non-empty geometries."
+            )
+
+        output_gpkg = os.path.join(output_dir, f"{Country_name}_adm.gpkg")
         if os.path.exists(output_gpkg):
             os.remove(output_gpkg)
+        target_gdf.to_file(
+            output_gpkg,
+            driver="GPKG",
+            layer=f"{Country_name}_adm",
+            layer_options={"SPATIAL_INDEX": "NO"},
+            engine="fiona",
+        )
 
+        print(f"Saved: {output_gpkg}")
+        return output_gpkg
+
+    def rasterize_farmlands(
+        Country_name=str,
+        reference_raster=None,
+        farmland_shapefile=None,
+        #class_lookup_csv=None,
+        target_vector=None,
+        output_dir=None,
+        out_nodata=255,
+        target_layer=None,
+        admin_level: int = None,
+    ):
+        """
+        Rasterize farmland polygons to the same grid as the reference land cover raster,
+        then sample those values on an existing GeoPackage and add a "farms" column.
+
+        Missing/no-farm pixels will have "NoFarm" in the 'farms' column.
+
+        If target_vector is not given, it defaults to the Step 1 output points layer:
+         - {Country_name}.gpkg if admin_level (or the notebook's Calibration_method, read
+           automatically if admin_level is not passed) is 0.
+         - {Country_name}_adm.gpkg if admin_level is 1 or 2 (the admin-tagged points layer
+           produced by sampling {Country_name}_adm.tif from rasterize_admin_boundaries).
+        """
         try:
-            # disable spatial index creation (avoids inserting into gpkg_extensions)
-                target_gdf.to_file(
-                output_gpkg,
-                driver="GPKG",
-                layer=f"{Country_name}_crp_farmland",
-                layer_options={"SPATIAL_INDEX": "NO"},
-                engine="fiona",
-            )
-        except Exception:
-            # fallback: write to temporary file then move into place
-            tmp_fp = output_gpkg + ".tmp"
-            if os.path.exists(tmp_fp):
-                os.remove(tmp_fp)
-            target_gdf.to_file(
-                tmp_fp,
-                driver="GPKG",
-                layer=f"{Country_name}_crp_farmland",
-                layer_options={"SPATIAL_INDEX": "NO"},
-                engine="fiona",
-            )
-            os.replace(tmp_fp, output_gpkg)
+            output_dir = os.path.join(Data_dir, "01.BaseCroplandLayer") if output_dir is None else output_dir
+            os.makedirs(output_dir, exist_ok=True)
 
-        return farmland_raster_path, output_gpkg
+            if reference_raster is None:
+                reference_raster = os.path.join(Input_data, f"{Country_name}_LandCover.tif")
+            if farmland_shapefile is None:
+                farmland_shapefile = os.path.join(Input_data, f"farmlands_reclassified.shp")
+            if target_vector is None:
+                if admin_level is None:
+                    frame = inspect.currentframe()
+                    try:
+                        caller = frame.f_back if frame is not None else None
+                        while caller is not None:
+                            if "Calibration_method" in caller.f_locals:
+                                admin_level = caller.f_locals["Calibration_method"]
+                                break
+                            if "Calibration_method" in caller.f_globals:
+                                admin_level = caller.f_globals["Calibration_method"]
+                                break
+                            caller = caller.f_back
+                    finally:
+                        del frame
+                admin_level = int(admin_level) if admin_level is not None else 0
+                if admin_level > 0:
+                    target_vector = os.path.join(output_dir, f"{Country_name}_adm.gpkg")
+                else:
+                    target_vector = os.path.join(output_dir, f"{Country_name}.gpkg")
+
+            if not os.path.exists(reference_raster):
+                raise FileNotFoundError(f"Reference raster not found: {reference_raster}")
+            if not os.path.exists(farmland_shapefile):
+                raise FileNotFoundError(f"Farmland shapefile not found: {farmland_shapefile}")
+            if not os.path.exists(target_vector):
+                raise FileNotFoundError(f"Target vector not found: {target_vector}")
+
+            farmlands = gpd.read_file(farmland_shapefile)
+            with rasterio.open(reference_raster) as src:
+                if farmlands.crs != src.crs:
+                    farmlands = farmlands.to_crs(src.crs)
+
+                existing_ints = set()
+                string_names = []
+                for _, row in farmlands.iterrows():
+                    v = row.get("crop_class", None)
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        continue
+                    # detect numeric-like values
+                    try:
+                        iv = int(v)
+                        existing_ints.add(int(iv))
+                    except Exception:
+                        s = str(v).strip()
+                        if s not in string_names:
+                            string_names.append(s)
+
+                # assign integer codes for string names, avoiding collisions with existing ints and nodata
+                start_code = 1
+                if existing_ints:
+                    start_code = max(existing_ints) + 1
+
+                class_to_value = {}
+                next_code = start_code
+                for name in sorted(string_names, key=lambda x: x.lower()):
+                    class_to_value[name] = next_code
+                    next_code += 1
+
+                # Build shapes list using either existing numeric code or assigned code
+                shapes = []
+                class_to_name = {}
+                for _, row in farmlands.iterrows():
+                    v = row.get("crop_class", None)
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        continue
+                    try:
+                        code = int(v)
+                        shapes.append((row.geometry, code))
+                        class_to_name[code] = str(v)
+                    except Exception:
+                        name = str(v).strip()
+                        code = class_to_value.get(name)
+                        if code is None:
+                            continue
+                        shapes.append((row.geometry, code))
+                        class_to_name[code] = name
+
+                if not shapes:
+                    raise ValueError("No farmland polygons with valid crop_class values found")
+
+                out_shape = (src.height, src.width)
+                rasterized = rasterize(
+                    shapes,
+                    out_shape=out_shape,
+                    transform=src.transform,
+                    fill=out_nodata,
+                    dtype=np.int16,
+                )
+
+                raster_meta = src.meta.copy()
+                raster_meta.update(
+                    driver="GTiff",
+                    dtype=rasterio.int16,
+                    count=1,
+                    nodata=out_nodata,
+                    compress="lzw",
+                )
+
+            farmland_raster_path = os.path.join(output_dir, f"{Country_name}_farmland.tif")
+            if os.path.exists(farmland_raster_path):
+                os.remove(farmland_raster_path)
+            with rasterio.open(farmland_raster_path, "w", **raster_meta) as dst:
+                dst.write(rasterized, 1)
+
+            # read target vector and ensure same CRS
+            target_gdf = gpd.read_file(target_vector, layer=target_layer) if target_layer else gpd.read_file(target_vector)
+            if target_gdf.crs != src.crs:
+                target_gdf = target_gdf.to_crs(src.crs)
+
+            # sample using point geometries (centroid for polygons)
+            if target_gdf.geometry.geom_type.isin(["Point", "MultiPoint"]).all():
+                sample_geoms = target_gdf.geometry
+            else:
+                sample_geoms = target_gdf.geometry.centroid
+
+            coords = [(geom.x, geom.y) for geom in sample_geoms]
+
+            sampled_vals = []
+            with rasterio.open(farmland_raster_path) as src:
+                for val in src.sample(coords):
+                    v = val[0]
+                    # treat nodata as missing
+                    if v == src.nodata or v == out_nodata or pd.isna(v):
+                        sampled_vals.append(None)
+                    else:
+                        try:
+                            sampled_vals.append(int(v))
+                        except Exception:
+                            sampled_vals.append(None)
+
+            target_gdf["crop_class"] = sampled_vals
+            # map to farmland names; missing -> "NoFarm"
+            target_gdf["farms"] = target_gdf["crop_class"].map(class_to_name).where(target_gdf["crop_class"].notnull(), "NoFarm")
+            # any unmapped numeric class -> NoFarm
+            target_gdf["farms"] = target_gdf["farms"].fillna("NoFarm")
+
+            # remove crop_class column before saving
+            if "crop_class" in target_gdf.columns:
+                target_gdf = target_gdf.drop(columns=["crop_class"])
+
+            output_gpkg = os.path.join(output_dir, f"{Country_name}_crp_farmland.gpkg")
+            # remove any existing (possibly corrupted) gpkg to force a clean create
+            if os.path.exists(output_gpkg):
+                os.remove(output_gpkg)
+
+            try:
+                # disable spatial index creation (avoids inserting into gpkg_extensions)
+                target_gdf.to_file(
+                    output_gpkg,
+                    driver="GPKG",
+                    layer=f"{Country_name}_crp_farmland",
+                    layer_options={"SPATIAL_INDEX": "NO"},
+                    engine="fiona",
+                )
+            except Exception:
+                # fallback: write to temporary file then move into place
+                tmp_fp = output_gpkg + ".tmp"
+                if os.path.exists(tmp_fp):
+                    os.remove(tmp_fp)
+                target_gdf.to_file(
+                    tmp_fp,
+                    driver="GPKG",
+                    layer=f"{Country_name}_crp_farmland",
+                    layer_options={"SPATIAL_INDEX": "NO"},
+                    engine="fiona",
+                )
+                os.replace(tmp_fp, output_gpkg)
+
+            return farmland_raster_path, output_gpkg
+
+        except Exception as e:
+            error_msg = (
+                f"\n{'='*80}\n"
+                f"ERROR in rasterize_farmlands: {str(e)}\n"
+                f"{'='*80}\n"
+                f"⚠️  BEFORE RUNNING THIS CELL, RUN THE NOTEBOOK: FarmlandClassification.ipynb\n"
+                f"\n"
+                f"This function requires farmland data to be processed first.\n"
+                f"Please complete the FarmlandClassification.ipynb notebook and ensure that\n"
+                f"the required files (e.g., farmlands_reclassified.shp) are created\n"
+                f"in the Data/00.InputData folder.\n"
+                f"{'='*80}\n"
+            )
+            print(error_msg)
+            raise
     
     def clip_rasters(
         Country_name= str,
@@ -607,98 +1076,6 @@ class Raster:
             else:
                 share_i = round(share_i, 2)
 
-            #share_r = float(total_R / total_A) if total_A > 0 else 0.0
-            #if share_r >= 0.95:
-                #share_r = 1.0
-            #elif share_r < 0.05:
-                #share_r = 0.0
-            #else:
-                #share_r = round(share_r, 2)
-
-            rows.append({
-                "crop": crop_code,
-                "I": total_I,
-                "R": total_R,
-                "A": total_A,
-                "Share_I": share_i,
-                #"Share_R": share_r,
-            })
-
-            # Only copy I raster if total_I > 0
-            if total_I > 0 and i_fp:
-                shutil.copy2(i_fp, os.path.join(filtered_dir, os.path.basename(i_fp)))
-            
-            # Only copy R raster if total_R > 0
-            if total_R > 0 and r_fp:
-                shutil.copy2(r_fp, os.path.join(filtered_dir, os.path.basename(r_fp)))
-
-        df = pd.DataFrame(rows, columns=["crop", "I", "R", "A", "Share_I"])
-        df.to_csv(summary_csv, index=False)
-
-        return filtered_dir, summary_csv, df
-
-    def mapspam_filter_crops(
-        Country_name=str,
-        reprojected_dir=None,
-        output_dir=None,
-        summary_csv=None,
-        out_nodata=255,
-    ):
-        output_root = os.path.join(Data_dir, f"02.{Country_name}_MAPSPAM_Crops") if output_dir is None else output_dir
-        filtered_dir = os.path.join(output_root, f"03.{Country_name}_Filtered_Rasters")
-        os.makedirs(filtered_dir, exist_ok=True)
-
-        if reprojected_dir is None:
-            reprojected_dir = os.path.join(output_root, "02.Reprojected_Rasters")
-        if summary_csv is None:
-            summary_csv = os.path.join(output_root, "MAPSPAMsummary_stat.csv")
-
-        if not os.path.isdir(reprojected_dir):
-            raise FileNotFoundError(f"Reprojected raster folder not found: {reprojected_dir}")
-
-        pattern = re.compile(r"spam2020_V2r2_global_H_([A-Z]{4})_([AIR])\.tif$", re.IGNORECASE)
-        crop_groups = {}
-
-        for input_fp in sorted(glob.glob(os.path.join(reprojected_dir, "*.tif"))):
-            match = pattern.match(os.path.basename(input_fp))
-            if not match:
-                continue
-            crop_code, crop_type = match.groups()
-            crop_groups.setdefault(crop_code, {})[crop_type.upper()] = input_fp
-
-        rows = []
-        for crop_code, files in crop_groups.items():
-            a_fp = files.get("A")
-            i_fp = files.get("I")
-            r_fp = files.get("R")
-
-            total_A = 0.0
-            total_I = 0.0
-            total_R = 0.0
-
-            if a_fp:
-                with rasterio.open(a_fp) as src_a:
-                    a_data = src_a.read(1, masked=True)
-                    total_A = float(np.sum(a_data.filled(0.0)))
-
-            if i_fp:
-                with rasterio.open(i_fp) as src_i:
-                    i_data = src_i.read(1, masked=True)
-                    total_I = float(np.sum(i_data.filled(0.0)))
-
-            if r_fp:
-                with rasterio.open(r_fp) as src_r:
-                    r_data = src_r.read(1, masked=True)
-                    total_R = float(np.sum(r_data.filled(0.0)))
-
-            share_i = float(total_I / total_A) if total_A > 0 else 0.0
-            if share_i >= 0.95:
-                share_i = 1.0
-            elif share_i < 0.05:
-                share_i = 0.0
-            else:
-                share_i = round(share_i, 2)
-
             rows.append({
                 "crop": crop_code,
                 "I": total_I,
@@ -716,7 +1093,7 @@ class Raster:
                         os.remove(output_i_fp)
                     with rasterio.open(output_i_fp, "w", **meta) as dst:
                         dst.write(src.read())
-            
+
             # Only copy R raster if total_R > 0 - preserve CRS by using rasterio
             if total_R > 0 and r_fp:
                 with rasterio.open(r_fp) as src:
@@ -927,6 +1304,132 @@ class Map:
         print(f"Saved resampled point vector: {os.path.basename(out_gpkg)} with {len(gdf)} points")
         return output_dir, out_gpkg, gdf
 
+    def calculate_admin_mapspam_summary(
+        Country_name: str,
+        input_gpkg: str = None,
+        landcover_tif: str = None,
+        out_dir: str = None,
+        summary_csv: str = None,
+        admin_level: int = None,
+    ):
+        """
+        Computes a MAPSPAM summary (I, R, A, Share_I per crop) per admin unit, from the
+        fine-resolution resampled cropland points (input_gpkg, default {Country_name}_crop_IR.gpkg)
+        rather than from the raw ~10km MAPSPAM rasters used by Raster.mapspam_filter_crops. By
+        this point density has already been resampled onto the fine land-cover grid, so this
+        avoids the small-district-smaller-than-one-MAPSPAM-pixel zonal-stat problem.
+
+        admin_level (or the notebook's Calibration_method, read automatically if admin_level is
+        not passed):
+         - 0: nothing to do (there is no admin column yet); prints a message and returns None.
+         - 1 or 2: input_gpkg must already contain an 'adm' column (adm1_name or adm2_name,
+           matching whichever level rasterize_admin_boundaries/rasterize_farmlands were run
+           with). Rows are grouped by 'adm', and for every crop column ({CODE}_I / {CODE}_R):
+            I = sum(density_I) * point_area_ha
+            R = sum(density_R) * point_area_ha
+            A = I + R
+            Share_I = I/A, snapped to 1.0 if >=0.99, to 0.0 if <0.01, else rounded to 2 dp
+           (same rule as Raster.mapspam_filter_crops).
+
+        Writes (default Data/03.Final/02.Calibration/MAPSPAMsummary_stat_adm{admin_level}.csv):
+            columns [adm, crop, I, R, A, Share_I]
+
+        Returns (summary_csv_path, DataFrame), or None if admin_level is 0.
+        """
+        if admin_level is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "Calibration_method" in caller.f_locals:
+                        admin_level = caller.f_locals["Calibration_method"]
+                        break
+                    if "Calibration_method" in caller.f_globals:
+                        admin_level = caller.f_globals["Calibration_method"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+        admin_level = int(admin_level) if admin_level is not None else 0
+
+        if admin_level <= 0:
+            print("Calibration_method is 0 (adm0); no admin-level MAPSPAM summary to compute.")
+            return None
+
+        if input_gpkg is None:
+            input_gpkg = os.path.join(
+                Data_dir, "03.Final", f"01.{Country_name}_crop_IR", f"{Country_name}_crop_IR.gpkg",
+            )
+        if landcover_tif is None:
+            landcover_tif = os.path.join(Input_data, f"{Country_name}_LandCover.tif")
+        if out_dir is None:
+            out_dir = os.path.join(Data_dir, "03.Final", "02.Calibration")
+        os.makedirs(out_dir, exist_ok=True)
+        if summary_csv is None:
+            summary_csv = os.path.join(out_dir, f"MAPSPAMsummary_stat_adm{admin_level}.csv")
+
+        if not os.path.exists(input_gpkg):
+            raise FileNotFoundError(f"Input gpkg not found: {input_gpkg}")
+        gdf = gpd.read_file(input_gpkg)
+
+        if "adm" not in gdf.columns:
+            raise ValueError(
+                f"'adm' column not found in {input_gpkg}. Calibration_method is set to "
+                f"{admin_level}, so the cropland points must already carry an 'adm' column "
+                f"(added upstream when the admin boundaries were sampled onto the points) "
+                f"before this summary can be computed."
+            )
+
+        if not os.path.exists(landcover_tif):
+            raise FileNotFoundError(f"Landcover raster not found: {landcover_tif}")
+        with rasterio.open(landcover_tif) as lc:
+            t = lc.transform
+            pixel_area_m2 = abs(t.a * t.e)
+            point_area_ha = pixel_area_m2 / 10000.0
+
+        crop_cols = [c for c in gdf.columns if isinstance(c, str) and re.match(r"^[A-Z]{4}_[IR]$", c)]
+        if not crop_cols:
+            raise ValueError("No MAPSPAM crop columns found in input gpkg")
+
+        records_I = []
+        records_R = []
+        for col in crop_cols:
+            crop = col.split("_")[0].upper()
+            system = col.split("_")[1].upper()
+            vals = pd.to_numeric(gdf[col].fillna(0), errors="coerce").fillna(0.0).astype(float) * point_area_ha
+            df = pd.DataFrame({"adm": gdf["adm"], "crop": crop, "value": vals})
+            (records_I if system == "I" else records_R).append(df)
+
+        def _group(records):
+            if not records:
+                return pd.DataFrame(columns=["adm", "crop", "value"])
+            long_df = pd.concat(records, ignore_index=True)
+            return long_df.groupby(["adm", "crop"], dropna=False, as_index=False)["value"].sum()
+
+        sum_I = _group(records_I).rename(columns={"value": "I"})
+        sum_R = _group(records_R).rename(columns={"value": "R"})
+
+        summary = sum_I.merge(sum_R, on=["adm", "crop"], how="outer")
+        summary["I"] = summary["I"].fillna(0.0)
+        summary["R"] = summary["R"].fillna(0.0)
+        summary["A"] = summary["I"] + summary["R"]
+
+        def _share_i(i_val, a_val):
+            share_i = float(i_val / a_val) if a_val > 0 else 0.0
+            if share_i >= 0.99:
+                return 1.0
+            elif share_i < 0.01:
+                return 0.0
+            return round(share_i, 2)
+
+        summary["Share_I"] = summary.apply(lambda r: _share_i(r["I"], r["A"]), axis=1)
+        summary = summary.sort_values(["adm", "crop"]).reset_index(drop=True)
+        summary = summary[["adm", "crop", "I", "R", "A", "Share_I"]]
+
+        summary.to_csv(summary_csv, index=False)
+        print(f"Saved admin-level MAPSPAM summary: {summary_csv}")
+
+        return summary_csv, summary
 
     def filter_empty_crop_points(
         Country_name=str,
@@ -1050,36 +1553,68 @@ class Map:
             Country_name: str,
             input_gpkg: str = None,
             landcover_tif: str = None,
-            out_dir: str = None, 
+            out_dir: str = None,
+            admin_level: int = None,
     ):
         """
-        This function calculates the total harvested area per crop from the created crop_IT_filtered.gpkg. 
-        The function multiplies crop's density by the point area (corresponding to the landcover pixel area) to get the harvested are (in hectares) per point. 
+        This function calculates the total harvested area per crop from the created crop_IT_filtered.gpkg.
+        The function multiplies crop's density by the point area (corresponding to the landcover pixel area) to get the harvested are (in hectares) per point.
+
+        admin_level (or the notebook's Calibration_method, read automatically if admin_level
+        is not passed):
+         - 0: national totals per crop (unchanged).
+         - 1 or 2: input_gpkg must already contain an 'adm' column. Totals are grouped by
+           'adm' AND crop instead of crop alone, so each output row is one (adm, crop) pair.
 
         Saves in out_dir (default Data/03.Final/02.Calibration):
-         - Sum_MAPSPAM_I.csv
-         - Sum_MAPSPAM_R.csv
+         - Sum_MAPSPAM_Irrigated.csv
+         - Sum_MAPSPAM_Rainfed.csv
+           columns [crop, MAPSPAM_HA] when admin_level is 0, or [adm, crop, MAPSPAM_HA]
+           when admin_level is 1 or 2.
 
-        Returns dict with output paths and dataframes.
+        Returns a message string with the output path(s).
         """
-    
+
         if landcover_tif is None:
             landcover_tif = os.path.join(Input_data, f"{Country_name}_LandCover.tif")
         if out_dir is None:
             out_dir = os.path.join(Data_dir, "03.Final", "02.Calibration")
         os.makedirs(out_dir, exist_ok=True)
 
+        if admin_level is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "Calibration_method" in caller.f_locals:
+                        admin_level = caller.f_locals["Calibration_method"]
+                        break
+                    if "Calibration_method" in caller.f_globals:
+                        admin_level = caller.f_globals["Calibration_method"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+        admin_level = int(admin_level) if admin_level is not None else 0
+
         # read filtered points gpkg
         if not os.path.exists(input_gpkg):
             raise FileNotFoundError(f"Input gpkg not found: {input_gpkg}")
         gdf = gpd.read_file(input_gpkg)
+
+        if admin_level > 0 and "adm" not in gdf.columns:
+            raise ValueError(
+                f"'adm' column not found in {input_gpkg}. Calibration_method is set to "
+                f"{admin_level}, so the cropland points must already carry an 'adm' column "
+                f"before this total can be computed."
+            )
 
         # compute point pixel area (ha) from landcover raster transform
         if not os.path.exists(landcover_tif):
             raise FileNotFoundError(f"Landcover raster not found: {landcover_tif}")
         with rasterio.open(landcover_tif) as lc:
             t = lc.transform #transform maps pixel coordinates (row,col) to geographic coordinates (x,y).
-            pixel_area_m2 = abs(t.a * t.e) #t.a is the width of a pixel and t.e is the height. 
+            pixel_area_m2 = abs(t.a * t.e) #t.a is the width of a pixel and t.e is the height.
             point_area_ha = pixel_area_m2 / 10000.0
 
         # identify MAPSPAM crop columns (format: XXXX_I or XXXX_R)
@@ -1087,36 +1622,43 @@ class Map:
         if not crop_cols:
             raise ValueError("No MAPSPAM crop columns found in filtered gpkg")
 
-        # Sum MAPSPAM area per crop/system: Area = density * point_area_ha
-        sums_I = {}
-        sums_R = {}
+        # Sum MAPSPAM area per crop/system (and per admin unit if admin_level > 0):
+        # Area = density * point_area_ha
+        records_I = []
+        records_R = []
         for col in crop_cols:
             crop = col.split("_")[0].upper()
             system = col.split("_")[1].upper()
-            vals = pd.to_numeric(gdf[col].fillna(0), errors="coerce").fillna(0.0).astype(float)
-            total_ha = float(vals.sum() * point_area_ha)
-            if system == "I":
-                sums_I[crop] = sums_I.get(crop, 0.0) + total_ha
-            else:
-                sums_R[crop] = sums_R.get(crop, 0.0) + total_ha
+            vals = pd.to_numeric(gdf[col].fillna(0), errors="coerce").fillna(0.0).astype(float) * point_area_ha
+            row = {"crop": crop, "MAPSPAM_HA": vals}
+            if admin_level > 0:
+                row["adm"] = gdf["adm"]
+            df = pd.DataFrame(row)
+            (records_I if system == "I" else records_R).append(df)
 
-        sumI_df = pd.DataFrame(sorted(sums_I.items()), columns=["crop", "MAPSPAM_HA"])
-        sumR_df = pd.DataFrame(sorted(sums_R.items()), columns=["crop", "MAPSPAM_HA"])
-        #sumT_df = (
-            #pd.concat([sumI_df.assign(type="I"), sumR_df.assign(type="R")], ignore_index=True)
-            #.groupby("crop", as_index=False)["MAPSPAM_HA"]
-            #.sum()
-        #)
+        group_cols = ["crop"] if admin_level <= 0 else ["adm", "crop"]
+
+        def _summarize(records):
+            if not records:
+                return pd.DataFrame(columns=group_cols + ["MAPSPAM_HA"])
+            long_df = pd.concat(records, ignore_index=True)
+            # dropna=False keeps a row for any point that didn't match an admin polygon,
+            # so unmatched harvested area is visible instead of silently dropped
+            summary = long_df.groupby(group_cols, dropna=False, as_index=False)["MAPSPAM_HA"].sum()
+            return summary.sort_values(group_cols).reset_index(drop=True)
+
+        sumI_df = _summarize(records_I)
+        sumR_df = _summarize(records_R)
 
         sumI_fp = os.path.join(out_dir, "Sum_MAPSPAM_Irrigated.csv")
         sumR_fp = os.path.join(out_dir, "Sum_MAPSPAM_Rainfed.csv")
-        #sumT_fp = os.path.join(out_dir, "Sum_MAPSPAM_total.csv")
-        
+
         sumI_df.to_csv(sumI_fp, index=False)
         sumR_df.to_csv(sumR_fp, index=False)
-        #sumT_df.to_csv(sumT_fp, index=False)
 
-        return (f"Total MAPSPAM harvested area per irrigated and rainfed crop saved to:\n  {sumI_fp}\n  {sumR_fp}\n")
+        return (f"Total MAPSPAM harvested area per irrigated and rainfed crop saved to:\n  {sumI_fp}\n  {sumR_fp}\n")    
+
+  
     
     def calculate_national_statistics(
             Country_name: str,
@@ -1140,7 +1682,7 @@ class Map:
         if cropnames_csv is None:
             cropnames_csv = os.path.join(Input_data, "CropNames.csv")
         if harvested_csv is None:
-            harvested_csv = os.path.join(Input_data, "FAOSTAT_HarvestedArea2020.csv")
+            harvested_csv = os.path.join(Input_data, "FAOSTAT_HarvestedArea2023.csv")
         if out_dir is None:
             out_dir = os.path.join(Data_dir, "03.Final", "02.Calibration")
         os.makedirs(out_dir, exist_ok=True)
@@ -1298,38 +1840,87 @@ class Map:
 
         return output_fp
 
-    def calculate_scaling_factor(Country_name: str):
+
+
+    def calculate_scaling_factor(Country_name: str, admin_level: int = None):
+
 
         """
-        This function calculates the scaling factor for each crop and system (irrigated/rainfed) 
+        This function calculates the scaling factor for each crop and system (irrigated/rainfed)
         by dividing the national harvested area by the MAPSPAM harvested area.
 
-        Reads:
-         - National_irrigated_crops_{Country_name}.csv
-         - National_rainfed_crops_{Country_name}.csv
-         - Sum_MAPSPAM_Irrigated.csv
-         - Sum_MAPSPAM_Rainfed.csv
+        admin_level (or the notebook's Calibration_method, read automatically if admin_level
+        is not passed):
+         - 0: one national scaling factor per crop (unchanged). Reads:
+            - National_irrigated_crops_{Country_name}.csv
+            - National_rainfed_crops_{Country_name}.csv
+            - Sum_MAPSPAM_Irrigated.csv
+            - Sum_MAPSPAM_Rainfed.csv
+         - 1 or 2: Input_data/adm{admin_level}_NationalStat.csv is read first. For every crop
+           that appears as a column in that file, that district's combined Target_HA is split
+           into irrigated/rainfed using that crop's adm-AND-crop-specific Share_I from
+           MAPSPAMsummary_stat_adm{admin_level}.csv (produced by calculate_admin_mapspam_summary),
+           then each system gets its own scaling factor, Target_system_HA / MAPSPAM_system_HA,
+           for that (adm, crop) — so scaling_factor_irrigated and scaling_factor_rainfed
+           genuinely differ, unlike before.
+           If MAPSPAM_system_HA is 0 for that (adm, crop, system) — no existing pixel to
+           scale — a multiplicative factor could never place that target area (factor x 0 is
+           always 0). That row is instead marked Method="inject" with Inject_HA set to the
+           target area, so calibrate_crops knows to ADD that area, spread evenly across the
+           district's points, rather than multiply. Every other row is Method="scale".
+           Any crop NOT covered by adm{admin_level}_NationalStat.csv instead uses the exact
+           same method as admin_level=0 (National_irrigated/rainfed_crops_{Country_name}.csv
+           vs. the nationally-summed MAPSPAM totals), with the resulting single national
+           factor per system replicated across every adm unit (always Method="scale").
 
         Writes:
          - scaling_factor_irrigated.csv
          - scaling_factor_rainfed.csv
+           columns [Crop, Scaling_factor] when admin_level is 0, or
+           [adm, crop, Scaling_factor, Method, Inject_HA] when admin_level is 1 or 2.
         """
         out_dir = os.path.join(Data_dir, "03.Final", "02.Calibration")
         os.makedirs(out_dir, exist_ok=True)
 
-        national_irr_fp = os.path.join(out_dir, f"National_irrigated_crops_{Country_name}.csv")
-        national_rain_fp = os.path.join(out_dir, f"National_rainfed_crops_{Country_name}.csv")
+        if admin_level is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "Calibration_method" in caller.f_locals:
+                        admin_level = caller.f_locals["Calibration_method"]
+                        break
+                    if "Calibration_method" in caller.f_globals:
+                        admin_level = caller.f_globals["Calibration_method"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+        admin_level = int(admin_level) if admin_level is not None else 0
+
         mapspam_i_fp = os.path.join(out_dir, "Sum_MAPSPAM_Irrigated.csv")
         mapspam_r_fp = os.path.join(out_dir, "Sum_MAPSPAM_Rainfed.csv")
-
-        if not os.path.exists(national_irr_fp):
-            raise FileNotFoundError(f"National irrigated CSV not found: {national_irr_fp}")
-        if not os.path.exists(national_rain_fp):
-            raise FileNotFoundError(f"National rainfed CSV not found: {national_rain_fp}")
         if not os.path.exists(mapspam_i_fp):
             raise FileNotFoundError(f"MAPSPAM irrigated summary CSV not found: {mapspam_i_fp}")
         if not os.path.exists(mapspam_r_fp):
             raise FileNotFoundError(f"MAPSPAM rainfed summary CSV not found: {mapspam_r_fp}")
+
+        national_irr_fp = os.path.join(out_dir, f"National_irrigated_crops_{Country_name}.csv")
+        national_rain_fp = os.path.join(out_dir, f"National_rainfed_crops_{Country_name}.csv")
+        if not os.path.exists(national_irr_fp):
+            raise FileNotFoundError(f"National irrigated CSV not found: {national_irr_fp}")
+        if not os.path.exists(national_rain_fp):
+            raise FileNotFoundError(f"National rainfed CSV not found: {national_rain_fp}")
+
+        def safe_scale(target_area, mapspam_area, crop, system):
+            target_area = float(target_area)
+            mapspam_area = float(mapspam_area)
+            if target_area <= 0.0:
+                return 0.0
+            if mapspam_area <= 0.0:
+                print(f"Warning: MAPSPAM {system} area is zero or missing for crop '{crop}'; setting scaling factor to 1.0")
+                return 1.0
+            return target_area / mapspam_area
 
         def _normalize_crop_area(df, crop_names, area_names):
             cols = {c.lower(): c for c in df.columns}
@@ -1343,38 +1934,6 @@ class Map:
             df["area"] = pd.to_numeric(df["area"].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
             return df
 
-        national_irr = _normalize_crop_area(
-            pd.read_csv(national_irr_fp, dtype=str).fillna(""),
-            crop_names=["mapspam_crop", "crop", "MAPSPAM_Crop", "MAPSPAM_CROP"],
-            area_names=["national_area (ha)", "national_area_ha", "national_area", "area"],
-        )
-        national_rain = _normalize_crop_area(
-            pd.read_csv(national_rain_fp, dtype=str).fillna(""),
-            crop_names=["mapspam_crop", "crop", "MAPSPAM_Crop", "MAPSPAM_CROP"],
-            area_names=["national_area (ha)", "national_area_ha", "national_area", "area"],
-        )
-
-        mapspam_i = _normalize_crop_area(
-            pd.read_csv(mapspam_i_fp, dtype=str).fillna(""),
-            crop_names=["crop"],
-            area_names=["mapspam_ha", "area", "value"],
-        )
-        mapspam_r = _normalize_crop_area(
-            pd.read_csv(mapspam_r_fp, dtype=str).fillna(""),
-            crop_names=["crop"],
-            area_names=["mapspam_ha", "area", "value"],
-        )
-
-        def safe_scale(national_area, mapspam_area, crop, system):
-            national_area = float(national_area)
-            mapspam_area = float(mapspam_area)
-            if national_area <= 0.0:
-                return 0.0
-            if mapspam_area <= 0.0:
-                print(f"Warning: MAPSPAM {system} area is zero or missing for crop '{crop}'; setting scaling factor to 1.0")
-                return 1.0
-            return national_area / mapspam_area
-
         def _build_scaling_df(national_df, mapspam_df, system):
             df = national_df.merge(mapspam_df, on="crop", how="left")
             df["mapspam_area"] = df["area_y"].fillna(0.0)
@@ -1387,11 +1946,191 @@ class Map:
             out["Crop"] = out["crop"]
             return out[["Crop", "Scaling_factor"]]
 
-        scaling_i_df = _build_scaling_df(national_irr, mapspam_i, "irrigated")
-        scaling_r_df = _build_scaling_df(national_rain, mapspam_r, "rainfed")
+        national_irr = _normalize_crop_area(
+            pd.read_csv(national_irr_fp, dtype=str).fillna(""),
+            crop_names=["mapspam_crop", "crop", "MAPSPAM_Crop", "MAPSPAM_CROP"],
+            area_names=["national_area (ha)", "national_area_ha", "national_area", "area"],
+        )
+        national_rain = _normalize_crop_area(
+            pd.read_csv(national_rain_fp, dtype=str).fillna(""),
+            crop_names=["mapspam_crop", "crop", "MAPSPAM_Crop", "MAPSPAM_CROP"],
+            area_names=["national_area (ha)", "national_area_ha", "national_area", "area"],
+        )
 
         scaling_i_fp = os.path.join(out_dir, "scaling_factor_irrigated.csv")
         scaling_r_fp = os.path.join(out_dir, "scaling_factor_rainfed.csv")
+
+        if admin_level <= 0:
+            mapspam_i = _normalize_crop_area(
+                pd.read_csv(mapspam_i_fp, dtype=str).fillna(""),
+                crop_names=["crop"],
+                area_names=["mapspam_ha", "area", "value"],
+            )
+            mapspam_r = _normalize_crop_area(
+                pd.read_csv(mapspam_r_fp, dtype=str).fillna(""),
+                crop_names=["crop"],
+                area_names=["mapspam_ha", "area", "value"],
+            )
+
+            scaling_i_df = _build_scaling_df(national_irr, mapspam_i, "irrigated")
+            scaling_r_df = _build_scaling_df(national_rain, mapspam_r, "rainfed")
+
+            scaling_i_df.to_csv(scaling_i_fp, index=False)
+            scaling_r_df.to_csv(scaling_r_fp, index=False)
+
+            return scaling_i_fp, scaling_r_fp
+
+        # --- admin_level 1 or 2 ---
+
+        district_csv = os.path.join(Input_data, f"adm{admin_level}_NationalStat.csv")
+        if not os.path.exists(district_csv):
+            raise FileNotFoundError(
+                f"Calibration_method is set to {admin_level} but "
+                f"'{os.path.basename(district_csv)}' was not found in {Input_data}. Check that "
+                f"Calibration_method matches an existing adm{{level}}_NationalStat.csv file."
+            )
+
+        admin_id_col = f"adm{admin_level}_name"
+        dist_df = pd.read_csv(district_csv, dtype=str)
+        if admin_id_col not in dist_df.columns:
+            raise ValueError(f"'{admin_id_col}' column not found in {district_csv}")
+
+        crop_cols_in_district = [
+            c for c in dist_df.columns if re.match(r"^[A-Za-z]{4}$", str(c).strip())
+        ]
+        district_crops = set(c.strip().upper() for c in crop_cols_in_district)
+
+        long_rows = []
+        for _, row in dist_df.iterrows():
+            adm_val = str(row[admin_id_col]).strip()
+            for c in crop_cols_in_district:
+                val = pd.to_numeric(str(row[c]).replace(",", ""), errors="coerce")
+                long_rows.append((adm_val, c.strip().upper(), 0.0 if pd.isna(val) else float(val)))
+        target_long = pd.DataFrame(long_rows, columns=["adm", "crop", "Target_HA"])
+
+        def _read_admin_mapspam(path):
+            df = pd.read_csv(path, dtype=str).fillna("")
+            cols = {c.lower(): c for c in df.columns}
+            adm_col = cols.get("adm")
+            crop_col = cols.get("crop")
+            area_col = next((cols[k] for k in ["mapspam_ha", "area", "value"] if k in cols), None)
+            if adm_col is None or crop_col is None or area_col is None:
+                raise ValueError(
+                    f"Expected columns 'adm', 'crop', 'MAPSPAM_HA' in {path}; found {df.columns.tolist()}. "
+                    f"Re-run mapspam_total_harvested_area with admin_level={admin_level} first."
+                )
+            out = df[[adm_col, crop_col, area_col]].copy()
+            out.columns = ["adm", "crop", "area"]
+            out["adm"] = out["adm"].astype(str).str.strip()
+            out["crop"] = out["crop"].astype(str).str.upper().str.strip()
+            out["area"] = pd.to_numeric(out["area"].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
+            return out
+
+        mapspam_i_adm = _read_admin_mapspam(mapspam_i_fp)
+        mapspam_r_adm = _read_admin_mapspam(mapspam_r_fp)
+
+        # adm-AND-crop-specific irrigated share, from calculate_admin_mapspam_summary's output
+        admin_summary_fp = os.path.join(out_dir, f"MAPSPAMsummary_stat_adm{admin_level}.csv")
+        if not os.path.exists(admin_summary_fp):
+            raise FileNotFoundError(
+                f"{admin_summary_fp} not found. Run Map.calculate_admin_mapspam_summary first — "
+                f"its Share_I per (adm, crop) is needed to split {os.path.basename(district_csv)}'s "
+                f"combined harvested area into irrigated/rainfed."
+            )
+        admin_summary = pd.read_csv(admin_summary_fp, dtype=str).fillna("")
+        admin_summary["adm"] = admin_summary["adm"].astype(str).str.strip()
+        admin_summary["crop"] = admin_summary["crop"].astype(str).str.upper().str.strip()
+        admin_summary["Share_I"] = pd.to_numeric(admin_summary["Share_I"], errors="coerce").fillna(0.0)
+
+        # crops covered by adm{admin_level}_NationalStat.csv: split Target_HA by adm+crop Share_I,
+        # then one scaling factor per system for that (adm, crop)
+        district_rows = target_long[target_long["crop"].isin(district_crops)].merge(
+            admin_summary[["adm", "crop", "Share_I"]], on=["adm", "crop"], how="left"
+        )
+        district_rows["Share_I"] = district_rows["Share_I"].fillna(0.0)
+        district_rows["Target_I_HA"] = district_rows["Target_HA"] * district_rows["Share_I"]
+        district_rows["Target_R_HA"] = district_rows["Target_HA"] - district_rows["Target_I_HA"]
+
+        district_rows = district_rows.merge(
+            mapspam_i_adm.rename(columns={"area": "MAPSPAM_I_HA"}), on=["adm", "crop"], how="left"
+        ).merge(
+            mapspam_r_adm.rename(columns={"area": "MAPSPAM_R_HA"}), on=["adm", "crop"], how="left"
+        )
+        district_rows["MAPSPAM_I_HA"] = district_rows["MAPSPAM_I_HA"].fillna(0.0)
+        district_rows["MAPSPAM_R_HA"] = district_rows["MAPSPAM_R_HA"].fillna(0.0)
+
+        def _scale_or_inject(target_area, mapspam_area, crop, system):
+            """
+            Like safe_scale, but when MAPSPAM has zero presence for this (adm, crop, system)
+            there is no pixel to multiply, so a multiplicative factor can never place the
+            district's target area (factor x 0 = 0 regardless of the factor). Instead this
+            flags the row for calibrate_crops to ADD the target area directly, spread evenly
+            across the district's points, rather than scale existing density.
+            Returns (scaling_factor, method, inject_ha).
+            """
+            target_area = float(target_area)
+            mapspam_area = float(mapspam_area)
+            if target_area <= 0.0:
+                return 0.0, "scale", 0.0
+            if mapspam_area <= 0.0:
+                print(
+                    f"Warning: MAPSPAM {system} area is zero for crop '{crop}'; the district "
+                    f"target ({target_area:.2f} ha) will be added evenly across the district's "
+                    f"points instead of scaled."
+                )
+                return 0.0, "inject", target_area
+            return target_area / mapspam_area, "scale", 0.0
+
+        district_rows[["Scaling_factor_I", "Method_I", "Inject_HA_I"]] = district_rows.apply(
+            lambda r: pd.Series(_scale_or_inject(r["Target_I_HA"], r["MAPSPAM_I_HA"], r["crop"], "district-irrigated")),
+            axis=1,
+        )
+        district_rows[["Scaling_factor_R", "Method_R", "Inject_HA_R"]] = district_rows.apply(
+            lambda r: pd.Series(_scale_or_inject(r["Target_R_HA"], r["MAPSPAM_R_HA"], r["crop"], "district-rainfed")),
+            axis=1,
+        )
+
+        district_factors_i = district_rows[["adm", "crop"]].assign(
+            Scaling_factor=district_rows["Scaling_factor_I"],
+            Method=district_rows["Method_I"],
+            Inject_HA=district_rows["Inject_HA_I"],
+        )
+        district_factors_r = district_rows[["adm", "crop"]].assign(
+            Scaling_factor=district_rows["Scaling_factor_R"],
+            Method=district_rows["Method_R"],
+            Inject_HA=district_rows["Inject_HA_R"],
+        )
+
+        # crops NOT covered by the district file: exact same method as admin_level=0,
+        # replicated across every adm unit
+        missing_crops = sorted((set(national_irr["crop"]) | set(national_rain["crop"])) - district_crops)
+        if missing_crops:
+            print(
+                f"{len(missing_crops)} crop(s) not covered by {os.path.basename(district_csv)}; "
+                f"falling back to the national (admin_level=0) scaling method for: {missing_crops}"
+            )
+
+        mapspam_i_national = mapspam_i_adm.groupby("crop", as_index=False)["area"].sum()
+        mapspam_r_national = mapspam_r_adm.groupby("crop", as_index=False)["area"].sum()
+
+        scaling_i_national = _build_scaling_df(national_irr, mapspam_i_national, "irrigated")
+        scaling_r_national = _build_scaling_df(national_rain, mapspam_r_national, "rainfed")
+
+        all_adm = sorted(target_long["adm"].unique())
+
+        def _fallback_expanded(scaling_national_df):
+            fallback = scaling_national_df[scaling_national_df["Crop"].isin(missing_crops)].rename(columns={"Crop": "crop"})
+            fallback = fallback.assign(Method="scale", Inject_HA=0.0)
+            return fallback.merge(pd.DataFrame({"adm": all_adm}), how="cross")[
+                ["adm", "crop", "Scaling_factor", "Method", "Inject_HA"]
+            ]
+
+        fallback_i = _fallback_expanded(scaling_i_national)
+        fallback_r = _fallback_expanded(scaling_r_national)
+
+        scaling_i_df = pd.concat([district_factors_i, fallback_i], ignore_index=True).sort_values(["adm", "crop"]).reset_index(drop=True)
+        scaling_r_df = pd.concat([district_factors_r, fallback_r], ignore_index=True).sort_values(["adm", "crop"]).reset_index(drop=True)
+
         scaling_i_df.to_csv(scaling_i_fp, index=False)
         scaling_r_df.to_csv(scaling_r_fp, index=False)
 
@@ -1403,13 +2142,31 @@ class Map:
         scaling_i_fp: str = None,
         scaling_r_fp: str = None,
         output_dir: str = None,
+        admin_level: int = None,
+        landcover_tif: str = None,
     ):
         """
         Calibrate crop density points using irrigated and rainfed scaling factors.
 
-        Reads the input crop GeoPackage and the two scaling factor CSVs.
-        Drops any crop column whose scaling factor is missing or zero.
-        Multiplies remaining crop values by the corresponding scaling factor.
+        admin_level (or the notebook's Calibration_method, read automatically if admin_level
+        is not passed):
+         - 0: scaling_i_fp/scaling_r_fp have columns [Crop, Scaling_factor] — one factor per
+           crop, applied uniformly to every row (unchanged). Any crop column whose factor is
+           missing or <= 0 is dropped entirely.
+         - 1 or 2: scaling_i_fp/scaling_r_fp instead have columns [adm, crop, Scaling_factor,
+           Method, Inject_HA] (from calculate_scaling_factor) — one row per admin unit AND
+           crop. input_gpkg must already have an 'adm' column.
+            - Method == "scale": the row is multiplied by Scaling_factor, as before, matched
+              on the point's own 'adm' value (so the same crop can be scaled differently in
+              different districts). A row whose (adm, crop) has no matching factor is treated
+              as factor 0.
+            - Method == "inject": MAPSPAM had zero presence for this (adm, crop, system), so
+              there is no density to multiply (factor x 0 is always 0). Instead, Inject_HA
+              (the district's target area, in hectares) is converted to a density and ADDED
+              equally to every point of that district: Inject_HA / (n_points_in_district x
+              point_area_ha). This is a sum, not a multiplication, so it can place area even
+              where the existing column value is exactly 0.
+
         Writes a calibrated output GeoPackage named
         f"{Country_name}_crop_IR_calibrated1.gpkg".
         """
@@ -1446,29 +2203,21 @@ class Map:
         if not os.path.exists(scaling_r_fp):
             raise FileNotFoundError(f"Rainfed scaling CSV not found: {scaling_r_fp}")
 
-        def _read_scaling_csv(path):
-            df = pd.read_csv(path, dtype=str).fillna("")
-            cols = {c.lower(): c for c in df.columns}
-            crop_col = next((cols[k] for k in ["crop"] if k in cols), None)
-            factor_col = next(
-                (cols[k] for k in ["scaling_factor", "scalingfactor", "factor", "value"] if k in cols),
-                None,
-            )
-            if crop_col is None or factor_col is None:
-                raise ValueError(
-                    f"Scaling factor CSV {path} must contain columns named 'Crop' and 'Scaling_factor'"
-                )
-            df = df[[crop_col, factor_col]].copy()
-            df.columns = ["crop", "scaling_factor"]
-            df["crop"] = df["crop"].astype(str).str.upper().str.strip()
-            df["scaling_factor"] = pd.to_numeric(
-                df["scaling_factor"].astype(str).str.replace(",", ""),
-                errors="coerce",
-            ).fillna(0.0)
-            return dict(zip(df["crop"], df["scaling_factor"]))
-
-        irrigated_factors = _read_scaling_csv(scaling_i_fp)
-        rainfed_factors = _read_scaling_csv(scaling_r_fp)
+        if admin_level is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "Calibration_method" in caller.f_locals:
+                        admin_level = caller.f_locals["Calibration_method"]
+                        break
+                    if "Calibration_method" in caller.f_globals:
+                        admin_level = caller.f_globals["Calibration_method"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+        admin_level = int(admin_level) if admin_level is not None else 0
 
         gdf = gpd.read_file(input_gpkg)
         if "farms" not in gdf.columns:
@@ -1484,24 +2233,146 @@ class Map:
         if not crop_cols:
             raise ValueError("No crop columns found after the 'farms' column.")
 
-        drop_cols = []
-        for col in crop_cols:
-            crop, system = col.rsplit("_", 1)
-            crop = crop.upper().strip()
-            system = system.upper().strip()
-            if system == "I":
-                factor = irrigated_factors.get(crop, 0.0)
-            else:
-                factor = rainfed_factors.get(crop, 0.0)
+        if admin_level <= 0:
+            def _read_scaling_csv(path):
+                df = pd.read_csv(path, dtype=str).fillna("")
+                cols_lower = {c.lower(): c for c in df.columns}
+                crop_col = next((cols_lower[k] for k in ["crop"] if k in cols_lower), None)
+                factor_col = next(
+                    (cols_lower[k] for k in ["scaling_factor", "scalingfactor", "factor", "value"] if k in cols_lower),
+                    None,
+                )
+                if crop_col is None or factor_col is None:
+                    raise ValueError(
+                        f"Scaling factor CSV {path} must contain columns named 'Crop' and 'Scaling_factor'"
+                    )
+                df = df[[crop_col, factor_col]].copy()
+                df.columns = ["crop", "scaling_factor"]
+                df["crop"] = df["crop"].astype(str).str.upper().str.strip()
+                df["scaling_factor"] = pd.to_numeric(
+                    df["scaling_factor"].astype(str).str.replace(",", ""),
+                    errors="coerce",
+                ).fillna(0.0)
+                return dict(zip(df["crop"], df["scaling_factor"]))
 
-            if factor <= 0.0:
-                drop_cols.append(col)
-                continue
+            irrigated_factors = _read_scaling_csv(scaling_i_fp)
+            rainfed_factors = _read_scaling_csv(scaling_r_fp)
 
-            gdf[col] = pd.to_numeric(gdf[col].fillna(0), errors="coerce").fillna(0.0) * float(factor)
+            drop_cols = []
+            for col in crop_cols:
+                crop, system = col.rsplit("_", 1)
+                crop = crop.upper().strip()
+                system = system.upper().strip()
+                if system == "I":
+                    factor = irrigated_factors.get(crop, 0.0)
+                else:
+                    factor = rainfed_factors.get(crop, 0.0)
 
-        if drop_cols:
-            gdf = gdf.drop(columns=drop_cols)
+                if factor <= 0.0:
+                    drop_cols.append(col)
+                    continue
+
+                gdf[col] = pd.to_numeric(gdf[col].fillna(0), errors="coerce").fillna(0.0) * float(factor)
+
+            if drop_cols:
+                gdf = gdf.drop(columns=drop_cols)
+
+        else:
+            if "adm" not in gdf.columns:
+                raise ValueError(
+                    f"'adm' column not found in {input_gpkg}. Calibration_method is set to "
+                    f"{admin_level}, so the cropland points must already carry an 'adm' column "
+                    f"before per-district calibration can be applied."
+                )
+
+            if landcover_tif is None:
+                landcover_tif = os.path.join(Input_data, f"{Country_name}_LandCover.tif")
+            if not os.path.exists(landcover_tif):
+                raise FileNotFoundError(f"Landcover raster not found: {landcover_tif}")
+            with rasterio.open(landcover_tif) as lc:
+                t = lc.transform
+                pixel_area_m2 = abs(t.a * t.e)
+                point_area_ha = pixel_area_m2 / 10000.0
+
+            adm_values = gdf["adm"].astype(str).str.strip()
+            n_points_per_adm = adm_values.value_counts()
+
+            def _read_admin_scaling_csv(path):
+                df = pd.read_csv(path, dtype=str).fillna("")
+                cols_lower = {c.lower(): c for c in df.columns}
+                adm_col = cols_lower.get("adm")
+                crop_col = cols_lower.get("crop")
+                factor_col = next(
+                    (cols_lower[k] for k in ["scaling_factor", "scalingfactor", "factor", "value"] if k in cols_lower),
+                    None,
+                )
+                if adm_col is None or crop_col is None or factor_col is None:
+                    raise ValueError(
+                        f"Scaling factor CSV {path} must contain columns 'adm', 'crop' and "
+                        f"'Scaling_factor' when Calibration_method > 0; found {df.columns.tolist()}"
+                    )
+                method_col = cols_lower.get("method")
+                inject_col = cols_lower.get("inject_ha")
+
+                df["adm"] = df[adm_col].astype(str).str.strip()
+                df["crop"] = df[crop_col].astype(str).str.upper().str.strip()
+                df["scaling_factor"] = pd.to_numeric(
+                    df[factor_col].astype(str).str.replace(",", ""),
+                    errors="coerce",
+                ).fillna(0.0)
+                df["method"] = (
+                    df[method_col].astype(str).str.strip().str.lower().replace("", "scale")
+                    if method_col
+                    else "scale"
+                )
+                df["inject_ha"] = (
+                    pd.to_numeric(df[inject_col].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
+                    if inject_col
+                    else 0.0
+                )
+
+                # nested dict: {crop: {adm: (factor, method, inject_ha)}} for a fast per-crop lookup
+                nested = {}
+                for crop, sub in df.groupby("crop"):
+                    nested[crop] = {
+                        row.adm: (row.scaling_factor, row.method, row.inject_ha)
+                        for row in sub.itertuples()
+                    }
+                return nested
+
+            irrigated_factors = _read_admin_scaling_csv(scaling_i_fp)
+            rainfed_factors = _read_admin_scaling_csv(scaling_r_fp)
+
+            for col in crop_cols:
+                crop, system = col.rsplit("_", 1)
+                crop = crop.upper().strip()
+                system = system.upper().strip()
+                factors_lookup = irrigated_factors if system == "I" else rainfed_factors
+                crop_factor_map = factors_lookup.get(crop, {})
+
+#This part is where the code injects the target area for crops that have no existing MAPSPAM presence 
+                factor_map = {}
+                additive_map = {}
+                for adm_val, (factor, method, inject_ha) in crop_factor_map.items():
+                    if method == "inject":
+                        n_points = n_points_per_adm.get(adm_val, 0) # number of cropland points per district
+                        additive = (
+                            inject_ha / (n_points * point_area_ha)
+                            if n_points > 0 and point_area_ha > 0
+                            else 0.0
+                        )
+                        factor_map[adm_val] = 1.0  # keep whatever (near-zero) density already exists
+                        additive_map[adm_val] = additive
+                    else:
+                        factor_map[adm_val] = factor
+                        additive_map[adm_val] = 0.0
+
+                row_factors = adm_values.map(factor_map).fillna(0.0).astype(float)
+                row_additive = adm_values.map(additive_map).fillna(0.0).astype(float)
+                gdf[col] = (
+                    pd.to_numeric(gdf[col].fillna(0), errors="coerce").fillna(0.0) * row_factors
+                    + row_additive
+                )
 
         output_fp = os.path.join(output_dir, f"{Country_name}_crop_IR_calibrated1.gpkg")
         if os.path.exists(output_fp):
@@ -1512,6 +2383,7 @@ class Map:
             driver="GPKG",
             layer=f"{Country_name}_crop_IR_calibrated1",
             layer_options={"SPATIAL_INDEX": "NO"},
+            engine="fiona",
         )
 
         return output_fp
@@ -1523,13 +2395,41 @@ class Map:
         out_gpkg_name: str = None,
         target_crs=None,
         tolerance: float = 1e-6,
+        admin_level: int = None,
+        landcover_tif: str = None,
     ):
         """
         Redistribute crop density so every point has total density <= 1.0.
 
-        Two-phase redistribution:
-        1) Prioritise the distribution of irrigated crops: all the rows where the value is > 1 is redistributed to the nearest point.
+        Two-phase redistribution, using a KD-tree (scipy.spatial.cKDTree) per group instead
+        of a brute-force nearest-neighbor search over every point, which is what made this
+        step slow before:
+        1) Prioritise the distribution of irrigated crops: rows where sum(_I) > 1 are
+           redistributed to the nearest point(s) with irrigated capacity.
         2) Finalise by redistributing only rainfed values so each row total <= 1.
+
+        admin_level (or the notebook's Calibration_method, read automatically if admin_level
+        is not passed):
+         - 0: both phases search nationwide (one KD-tree over every point) — same scope as
+           before, just faster.
+         - 1 or 2: input_gpkg must have an 'adm' column. Both phases are run independently
+           PER ADMIN UNIT — a separate KD-tree is built per adm, and excess density can only
+           be redistributed to another point in the SAME adm, never across district/province
+           borders. This keeps the per-district calibration from Map.calibrate_crops from
+           being undone by redistribution leaking mass elsewhere, and is also much faster
+           than a national search, since each group is a small fraction of the whole dataset.
+           If a specific admin unit's own total demand (summed across every crop and both
+           systems) exceeds how many cropland pixels it has, Phase 2 cannot place all of it
+           within that admin unit no matter how it's rearranged. Rather than raising an error,
+           it caps that admin unit's rainfed total to whatever capacity remains after
+           irrigated is protected (irrigated is never reduced here — "irrigation is always
+           prioritised"): every rainfed crop column in that admin unit is multiplied by the
+           SAME single scale factor, so each crop's share of the admin unit's rainfed total
+           (as reported in the sub-national statistics) is preserved exactly, only the overall
+           level is brought down to fit. Every (adm, crop) this happens to is logged to
+           Data/03.Final/02.Calibration/redistribution_capacity_shortfall.csv, columns
+           [adm, crop, Original_Rainfed_HA, Scale_Factor, Final_Rainfed_HA, Unallocated_HA].
+           The file is always written (empty but with headers if nothing needed capping).
 
         Returns output path.
         """
@@ -1550,6 +2450,22 @@ class Map:
             out_gpkg_name = f"{Country_name}_crop_IR_calibrated2.gpkg"
         output_fp = os.path.join(output_dir, out_gpkg_name)
 
+        if admin_level is None:
+            frame = inspect.currentframe()
+            try:
+                caller = frame.f_back if frame is not None else None
+                while caller is not None:
+                    if "Calibration_method" in caller.f_locals:
+                        admin_level = caller.f_locals["Calibration_method"]
+                        break
+                    if "Calibration_method" in caller.f_globals:
+                        admin_level = caller.f_globals["Calibration_method"]
+                        break
+                    caller = caller.f_back
+            finally:
+                del frame
+        admin_level = int(admin_level) if admin_level is not None else 0
+
         gdf = gpd.read_file(input_gpkg)
         if target_crs is not None:
             gdf = gdf.to_crs(target_crs)
@@ -1566,10 +2482,27 @@ class Map:
         if not crop_cols:
             raise ValueError("No crop columns found after the 'farms' column.")
 
+        if admin_level > 0 and "adm" not in gdf.columns:
+            raise ValueError(
+                f"'adm' column not found in {input_gpkg}. Calibration_method is set to "
+                f"{admin_level}, so the cropland points must already carry an 'adm' column "
+                f"before per-district redistribution can be applied."
+            )
+
+        if admin_level > 0:
+            if landcover_tif is None:
+                landcover_tif = os.path.join(Input_data, f"{Country_name}_LandCover.tif")
+            if not os.path.exists(landcover_tif):
+                raise FileNotFoundError(f"Landcover raster not found: {landcover_tif}")
+            with rasterio.open(landcover_tif) as lc:
+                t = lc.transform
+                point_area_ha = abs(t.a * t.e) / 10000.0
+            shortfall_records = []
+
         rainfed_cols = [c for c in crop_cols if c.endswith("_R")]
         irrigated_cols = [c for c in crop_cols if c.endswith("_I")]
 
-        # numeric matrices
+        # numeric matrices (one row per point, one column per crop/system)
         values_R = gdf[rainfed_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float).to_numpy() if rainfed_cols else np.zeros((len(gdf), 0), dtype=float)
         values_I = gdf[irrigated_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float).to_numpy() if irrigated_cols else np.zeros((len(gdf), 0), dtype=float)
 
@@ -1577,175 +2510,279 @@ class Map:
         if coords.size == 0:
             raise ValueError("Input GeoPackage contains no geometries.")
 
-        nI = values_I.shape[1]
-        nR = values_R.shape[1]
-
-        sum_I = np.sum(values_I, axis=1) if nI > 0 else np.zeros(len(gdf), dtype=float)
-        sum_R = np.sum(values_R, axis=1) if nR > 0 else np.zeros(len(gdf), dtype=float)
-        total = sum_I + sum_R
-
-        # Phase 1: redistribute irrigated-only so no row has sum(I) > 1
-        cols_I = [c for c in cols if c.endswith('_I')]
-        values_I = gdf[cols_I].fillna(0).values.astype(float)
-        coords = np.array([[pt.x, pt.y] for pt in gdf.geometry])
-        sum_I = values_I.sum(axis=1)
-
-        def nn_indices(src_idx):
-            d = np.sum((coords - coords[src_idx])**2, axis=1)
-            order = np.argsort(d)
-            return order[order != src_idx]
-
-        it = 0
-        max_iters = 10000
         tol = 1e-8
-        while True:
-            over = np.where(sum_I > 1.0 + tol)[0]
-            if len(over) == 0:
-                break
-            if it > max_iters:
-                raise RuntimeError("Phase1: max iters reached")
-            # pick source with largest irrigated excess
-            src = over[np.argmax(sum_I[over] - 1.0)]
-            excess = sum_I[src] - 1.0
-            if excess <= tol:
-                sum_I[src] = min(sum_I[src], 1.0)
-                it += 1
-                continue
+        max_iters = 10000
 
-            src_comp = values_I[src].copy()
-            total_src_comp = src_comp.sum()
-            # if source has no irrigated composition (rare), scale down to 1.0
-            if total_src_comp <= tol:
-                if sum_I[src] > 1.0:
-                    values_I[src] *= (1.0 / sum_I[src])
-                    sum_I[src] = values_I[src].sum()
-                it += 1
-                continue
+        # groups to redistribute independently: one per adm unit, or a single national group
+        if admin_level > 0:
+            adm_values = gdf["adm"].astype(str).str.strip().to_numpy()
+            group_labels = sorted(set(adm_values))
+            group_indices = {g: np.where(adm_values == g)[0] for g in group_labels}
+        else:
+            group_labels = ["the whole country"]
+            group_indices = {group_labels[0]: np.arange(len(gdf))}
 
-            # try to transfer to nearest receivers with irrigated capacity
-            targets = nn_indices(src)
-            for t in targets:
-                cap = max(0.0, 1.0 - sum_I[t])
-                if cap <= tol:
-                    continue
-                transfer = min(excess, cap)
-                frac = src_comp / total_src_comp
-                move = frac * transfer
-                values_I[t] += move
-                values_I[src] -= move
-                sum_I[t] = values_I[t].sum()
-                sum_I[src] = values_I[src].sum()
-                excess = sum_I[src] - 1.0
-                if sum_I[src] <= 1.0 + tol:
+        def _expanding_knn_receivers(tree, coords_local, capacity_local, src_local, k_start=16):
+            """
+            Yields local indices (within one group) in roughly nearest-first order, limited
+            to points with spare capacity, by querying the KD-tree with an expanding k instead
+            of sorting distances to every point in the group up front.
+            """
+            n_local = len(coords_local)
+            if n_local <= 1:
+                return
+            seen = np.zeros(n_local, dtype=bool)
+            seen[src_local] = True
+            k = min(k_start, n_local)
+            while True:
+                _, idxs = tree.query(coords_local[src_local], k=k)
+                idxs = np.atleast_1d(idxs)
+                for j in idxs:
+                    j = int(j)
+                    if seen[j]:
+                        continue
+                    seen[j] = True
+                    if capacity_local[j] > tol:
+                        yield j
+                if k >= n_local:
+                    return
+                k = min(k * 4, n_local)
+
+        # ------------------------------------------------------------------
+        # Phase 1: redistribute irrigated-only so no row has sum(I) > 1, per group
+        # ------------------------------------------------------------------
+        for group_label in group_labels:
+            idx = group_indices[group_label]
+            if idx.size == 0:
+                continue
+            coords_local = coords[idx]
+            values_I_local = values_I[idx].copy()
+            sum_I_local = values_I_local.sum(axis=1) if values_I_local.size else np.zeros(idx.size)
+            tree = cKDTree(coords_local) if idx.size > 1 else None
+
+            it = 0
+            while True:
+                over = np.where(sum_I_local > 1.0 + tol)[0]
+                if len(over) == 0:
                     break
+                if it > max_iters:
+                    raise RuntimeError(f"Phase1: max iters reached in {group_label}")
+                src = over[np.argmax(sum_I_local[over] - 1.0)]
+                excess = sum_I_local[src] - 1.0
+                if excess <= tol:
+                    sum_I_local[src] = min(sum_I_local[src], 1.0)
+                    it += 1
+                    continue
 
-            # if no receiver accepted flow, scale source down to 1.0
-            if values_I[src].sum() > 1.0 + tol:
-                scale = 1.0 / values_I[src].sum()
-                values_I[src] *= scale
-                sum_I[src] = values_I[src].sum()
+                src_comp = values_I_local[src].copy()
+                total_src_comp = src_comp.sum()
+                if total_src_comp <= tol:
+                    if sum_I_local[src] > 1.0:
+                        values_I_local[src] *= (1.0 / sum_I_local[src])
+                        sum_I_local[src] = values_I_local[src].sum()
+                    it += 1
+                    continue
 
-            it += 1
+                if tree is not None:
+                    capacity_local = np.maximum(1.0 - sum_I_local, 0.0)
+                    for t in _expanding_knn_receivers(tree, coords_local, capacity_local, src):
+                        cap = max(0.0, 1.0 - sum_I_local[t])
+                        if cap <= tol:
+                            continue
+                        transfer = min(excess, cap)
+                        frac = src_comp / total_src_comp
+                        move = frac * transfer
+                        values_I_local[t] += move
+                        values_I_local[src] -= move
+                        sum_I_local[t] = values_I_local[t].sum()
+                        sum_I_local[src] = values_I_local[src].sum()
+                        excess = sum_I_local[src] - 1.0
+                        if sum_I_local[src] <= 1.0 + tol:
+                            break
+
+                # if no receiver in this group accepted enough flow, scale source down to 1.0
+                if values_I_local[src].sum() > 1.0 + tol:
+                    scale = 1.0 / values_I_local[src].sum()
+                    values_I_local[src] *= scale
+                    sum_I_local[src] = values_I_local[src].sum()
+
+                it += 1
+
+            values_I[idx] = values_I_local
 
         # write irrigated back to gdf (rainfed columns unchanged in Phase 1)
-        for i, c in enumerate(cols_I):
+        for i, c in enumerate(irrigated_cols):
             gdf[c] = values_I[:, i]
 
-        # Phase 2: redistribute only rainfed to satisfy total<=1
-        sum_I = np.sum(values_I, axis=1) if values_I.size else np.zeros(len(gdf), dtype=float)
-        total = sum_I + (np.sum(values_R, axis=1) if values_R.size else 0.0)
-        capacity = np.maximum(1.0 - total, 0.0)
-
-        # helper functions
-        def get_receivers(exclude_idx=None):
-            receiver_mask = capacity > tolerance
-            if exclude_idx is not None:
-                receiver_mask[exclude_idx] = False
-            return np.where(receiver_mask)[0]
-
-        def distance_order(source_idx, receiver_idxs):
-            if receiver_idxs.size == 0:
-                return receiver_idxs
-            delta = coords[receiver_idxs] - coords[source_idx]
-            dist = np.hypot(delta[:, 0], delta[:, 1])
-            return receiver_idxs[np.argsort(dist)]
-
-        # loop redistributing rainfed only
-        while True:
-            total = np.sum(values_R, axis=1) + (np.sum(values_I, axis=1) if values_I.size else 0.0)
-            overloaded = np.where(total > 1.0 + tolerance)[0]
-            if overloaded.size == 0:
-                break
-
-            excess = total[overloaded] - 1.0
-            order = np.argsort(-excess)
-            source_idx = overloaded[order[0]]
-            source_excess = excess[order[0]]
-            if source_excess <= tolerance:
-                break
-
-            sum_R_source = float(np.sum(values_R[source_idx])) if values_R.size else 0.0
-            if sum_R_source <= tolerance:
-                # cannot move rainfed; scale down proportionally to meet constraint
-                src_sum = np.sum(values_I[source_idx]) + np.sum(values_R[source_idx])
-                if src_sum > 1.0 + tolerance:
-                    scale = 1.0 / src_sum
-                    if values_R.size:
-                        values_R[source_idx] *= scale
-                    if values_I.size:
-                        values_I[source_idx] *= scale
-                # recompute capacity and continue
-                sum_I = np.sum(values_I, axis=1) if values_I.size else np.zeros(len(gdf), dtype=float)
-                capacity = np.maximum(1.0 - (np.sum(values_R, axis=1) + sum_I), 0.0)
+        # ------------------------------------------------------------------
+        # Phase 2: redistribute only rainfed to satisfy total<=1, per group
+        # ------------------------------------------------------------------
+        for group_label in group_labels:
+            idx = group_indices[group_label]
+            if idx.size == 0:
                 continue
+            coords_local = coords[idx]
+            values_I_local = values_I[idx].copy()
+            values_R_local = values_R[idx].copy()
+            tree = cKDTree(coords_local) if idx.size > 1 else None
 
-            receivers = get_receivers(exclude_idx=source_idx)
-            if receivers.size == 0:
-                allowed_rainfed = max(1.0 - sum_I[source_idx], 0.0)
-                cur_rainfed = sum_R_source
-                if cur_rainfed > allowed_rainfed + tolerance:
-                    scale = allowed_rainfed / cur_rainfed if cur_rainfed > 0 else 0.0
-                    values_R[source_idx] *= scale
-                capacity = np.maximum(1.0 - (np.sum(values_R, axis=1) + sum_I), 0.0)
-                continue
+            sum_I_local = np.sum(values_I_local, axis=1) if values_I_local.size else np.zeros(idx.size)
+            total_local = sum_I_local + (np.sum(values_R_local, axis=1) if values_R_local.size else 0.0)
+            capacity_local = np.maximum(1.0 - total_local, 0.0)
 
-            receiver_order = distance_order(source_idx, receivers)
-            proportions = values_R[source_idx] / sum_R_source
-            remaining = total[source_idx] - 1.0
+            # If this admin unit's total demand exceeds its own pixel capacity, no amount of
+            # within-district rearranging can fit it. Cap it: irrigated is never touched
+            # ("irrigation is always prioritised"), so every rainfed crop column is scaled by
+            # the SAME single factor, preserving each crop's share of the rainfed total
+            # exactly as reported, only bringing the overall level down to fit.
+            if admin_level > 0 and values_R_local.size:
+                capacity_for_rainfed = idx.size - float(sum_I_local.sum())
+                rainfed_demand = float(values_R_local.sum())
+                if rainfed_demand > capacity_for_rainfed + tolerance and rainfed_demand > 0:
+                    cap_scale = max(capacity_for_rainfed, 0.0) / rainfed_demand
+                    for col_idx, col in enumerate(rainfed_cols):
+                        crop = col.rsplit("_", 1)[0]
+                        original_ha = float(values_R_local[:, col_idx].sum()) * point_area_ha
+                        if original_ha <= tolerance:
+                            continue
+                        final_ha = original_ha * cap_scale
+                        shortfall_records.append({
+                            "adm": group_label,
+                            "crop": crop,
+                            "Original_Rainfed_HA": original_ha,
+                            "Scale_Factor": cap_scale,
+                            "Final_Rainfed_HA": final_ha,
+                            "Unallocated_HA": original_ha - final_ha,
+                        })
+                    values_R_local *= cap_scale
+                    total_local = sum_I_local + np.sum(values_R_local, axis=1)
+                    capacity_local = np.maximum(1.0 - total_local, 0.0)
+                    print(
+                        f"Capped rainfed demand in {group_label} to its own pixel capacity "
+                        f"(scale factor {cap_scale:.4f}); see redistribution_capacity_shortfall.csv"
+                    )
 
-            for recv_idx in receiver_order:
-                if remaining <= tolerance:
+            while True:
+                overloaded = np.where(total_local > 1.0 + tolerance)[0]
+                if overloaded.size == 0:
                     break
-                accept = min(remaining, capacity[recv_idx])
-                if accept <= tolerance:
+
+                excess = total_local[overloaded] - 1.0
+                order = np.argsort(-excess)
+                source_idx = overloaded[order[0]]
+                source_excess = excess[order[0]]
+                if source_excess <= tolerance:
+                    break
+
+                sum_R_source = float(np.sum(values_R_local[source_idx])) if values_R_local.size else 0.0
+                if sum_R_source <= tolerance:
+                    # cannot move rainfed; scale down proportionally to meet constraint
+                    src_sum = np.sum(values_I_local[source_idx]) + np.sum(values_R_local[source_idx])
+                    if src_sum > 1.0 + tolerance:
+                        scale = 1.0 / src_sum
+                        if values_R_local.size:
+                            values_R_local[source_idx] *= scale
+                        if values_I_local.size:
+                            values_I_local[source_idx] *= scale
+                    sum_I_local = np.sum(values_I_local, axis=1) if values_I_local.size else np.zeros(idx.size)
+                    total_local = sum_I_local + (np.sum(values_R_local, axis=1) if values_R_local.size else 0.0)
+                    capacity_local = np.maximum(1.0 - total_local, 0.0)
                     continue
-                delta = accept * proportions
-                values_R[source_idx] = np.maximum(values_R[source_idx] - delta, 0.0)
-                values_R[recv_idx] += delta
-                total[source_idx] -= accept
-                total[recv_idx] += accept
-                capacity[recv_idx] = max(1.0 - total[recv_idx], 0.0)
-                remaining -= accept
 
-            if remaining > tolerance:
-                allowed_rainfed = max(1.0 - sum_I[source_idx], 0.0)
-                cur_rainfed = float(np.sum(values_R[source_idx]))
-                if cur_rainfed > allowed_rainfed + tolerance:
-                    scale = allowed_rainfed / cur_rainfed if cur_rainfed > 0 else 0.0
-                    values_R[source_idx] *= scale
+                has_other_receiver = tree is not None and np.any(
+                    np.delete(capacity_local, source_idx) > tolerance
+                )
+                if not has_other_receiver:
+                    allowed_rainfed = max(1.0 - sum_I_local[source_idx], 0.0)
+                    cur_rainfed = sum_R_source
+                    if cur_rainfed > allowed_rainfed + tolerance:
+                        scale = allowed_rainfed / cur_rainfed if cur_rainfed > 0 else 0.0
+                        values_R_local[source_idx] *= scale
+                    total_local = sum_I_local + np.sum(values_R_local, axis=1)
+                    capacity_local = np.maximum(1.0 - total_local, 0.0)
+                    continue
 
-            sum_I = np.sum(values_I, axis=1) if values_I.size else np.zeros(len(gdf), dtype=float)
-            capacity = np.maximum(1.0 - (np.sum(values_R, axis=1) + sum_I), 0.0)
+                proportions = values_R_local[source_idx] / sum_R_source
+                remaining = total_local[source_idx] - 1.0
+
+                for recv_idx in _expanding_knn_receivers(tree, coords_local, capacity_local, source_idx):
+                    if remaining <= tolerance:
+                        break
+                    accept = min(remaining, capacity_local[recv_idx])
+                    if accept <= tolerance:
+                        continue
+                    delta = accept * proportions
+                    values_R_local[source_idx] = np.maximum(values_R_local[source_idx] - delta, 0.0)
+                    values_R_local[recv_idx] += delta
+                    total_local[source_idx] -= accept
+                    total_local[recv_idx] += accept
+                    capacity_local[recv_idx] = max(1.0 - total_local[recv_idx], 0.0)
+                    remaining -= accept
+
+                if remaining > tolerance:
+                    allowed_rainfed = max(1.0 - sum_I_local[source_idx], 0.0)
+                    cur_rainfed = float(np.sum(values_R_local[source_idx]))
+                    if cur_rainfed > allowed_rainfed + tolerance:
+                        global_row = idx[source_idx]
+                        error_msg = (
+                            f"\n{'='*80}\n"
+                            f"REDISTRIBUTION ERROR: Maximum redistribution potential reached\n"
+                            f"{'='*80}\n"
+                            f"Cannot redistribute all crop density to points with density > 1.0\n"
+                            f"within {group_label}.\n"
+                            f"At row index {global_row}, total density = {total_local[source_idx]:.4f} (> 1.0)\n"
+                            f"Remaining excess: {remaining:.6f}\n\n"
+                            f"This indicates that the cropland pixels in {group_label}\n"
+                            f"do not have enough capacity for all the harvested areas\n"
+                            f"even after redistribution.\n\n"
+                            f"Possible solutions:\n"
+                            f"  1. Change 'cropland_value' to include/exclude different pixel values\n"
+                            f"  2. Update the land cover raster (land_cover.tif) with more recent data\n"
+                            f"  3. Check FAOSTAT statistics for accuracy and completeness\n"
+                            f"  4. Verify national/sub-national statistics are appropriate for the study year\n"
+                            f"{'='*80}\n"
+                        )
+                        raise ValueError(error_msg)
+
+                sum_I_local = np.sum(values_I_local, axis=1) if values_I_local.size else np.zeros(idx.size)
+                total_local = sum_I_local + (np.sum(values_R_local, axis=1) if values_R_local.size else 0.0)
+                capacity_local = np.maximum(1.0 - total_local, 0.0)
+
+            values_I[idx] = values_I_local
+            values_R[idx] = values_R_local
 
         # write back
-        for idx, col in enumerate(irrigated_cols):
-            gdf[col] = values_I[:, idx] if values_I.size else 0.0
-        for idx, col in enumerate(rainfed_cols):
-            gdf[col] = values_R[:, idx] if values_R.size else 0.0
+        for idx_col, col in enumerate(irrigated_cols):
+            gdf[col] = values_I[:, idx_col] if values_I.size else 0.0
+        for idx_col, col in enumerate(rainfed_cols):
+            gdf[col] = values_R[:, idx_col] if values_R.size else 0.0
+
+        if admin_level > 0:
+            shortfall_dir = os.path.join(Data_dir, "03.Final", "02.Calibration")
+            os.makedirs(shortfall_dir, exist_ok=True)
+            shortfall_fp = os.path.join(shortfall_dir, "redistribution_capacity_shortfall.csv")
+            shortfall_df = pd.DataFrame(
+                shortfall_records,
+                columns=["adm", "crop", "Original_Rainfed_HA", "Scale_Factor", "Final_Rainfed_HA", "Unallocated_HA"],
+            )
+            shortfall_df.to_csv(shortfall_fp, index=False)
+            if len(shortfall_df):
+                print(
+                    f"{shortfall_df['adm'].nunique()} admin unit(s) had their rainfed demand "
+                    f"capped to fit their own pixel capacity; details in {shortfall_fp}"
+                )
+            else:
+                print(f"No admin unit needed capping; wrote empty report to {shortfall_fp}")
 
         if os.path.exists(output_fp):
             os.remove(output_fp)
-        gdf.to_file(output_fp, driver="GPKG", layer=f"{Country_name}_crop_IR_calibrated2", layer_options={"SPATIAL_INDEX": "NO"})
+        gdf.to_file(
+            output_fp,
+            driver="GPKG",
+            layer=f"{Country_name}_crop_IR_calibrated2",
+            layer_options={"SPATIAL_INDEX": "NO"},
+            engine="fiona",
+        )
 
         return output_fp
 
@@ -2025,6 +3062,7 @@ class Map:
             driver="GPKG",
             layer=f"{Country_name}_cropland",
             layer_options={"SPATIAL_INDEX": "NO"},
+            engine="fiona",
         )
 
         return output_fp
@@ -2086,6 +3124,7 @@ class Map:
             driver="GPKG",
             layer=f"{Country_name}_irrigated",
             layer_options={"SPATIAL_INDEX": "NO"},
+            engine="fiona",
         )
 
         return output_fp
@@ -2442,7 +3481,7 @@ class Water:
         if os.path.exists(out_gpkg):
             os.remove(out_gpkg)
 
-        gdf.to_file(out_gpkg, driver='GPKG', layer='cwd', layer_options={'SPATIAL_INDEX': 'NO'})
+        gdf.to_file(out_gpkg, driver='GPKG', layer='cwd', layer_options={'SPATIAL_INDEX': 'NO'}, engine='fiona')
 
         return out_gpkg, gdf
     
